@@ -33,6 +33,7 @@
     - [4.1 Hybrid Strategy](#41-hybrid-strategy)
     - [4.2 Implementation Checklist](#42-implementation-checklist)
     - [4.3 Performance Optimizations](#43-performance-optimizations)
+        - [4.3.1 Lock Contention and MongoDB Locking Behavior](#431-lock-contention-and-mongodb-locking-behavior)
     - [4.4 Sample Implementation Structure](#44-sample-implementation-structure)
 - [5. Query Modifications for Archived Data](#5-query-modifications-for-archived-data)
     - [5.1 Application Query Updates](#51-application-query-updates)
@@ -80,6 +81,7 @@ This section provides the current data volume statistics from the asiacrm MongoD
 | **promotionRedemptionFailureLog** | 176K | 55.03 MB | 1.36 kB | 13.64 MB | **~68.67 MB** |
 | **codeBasedPromotionMeta** | 65K | 8.99 MB | 458 B | 3.25 MB | **~12.24 MB** |
 | **cartEvaluationReservation** | 62 | 1.13 MB | 510 B | 1.24 MB | **~2.37 MB** |
+| **jv_snapshots** | 4.1M | 739.45 MB | 1.25 kB | 336.24 MB | **~1.08 GB** |
 
 ### Low Volume Collections
 
@@ -634,6 +636,107 @@ This section lists all collections that reference `PromotionMeta` (via `promotio
     - **Volume**: Low to medium
     - **Retention**: Short-term (TTL handles cleanup)
 
+#### 17. jv_snapshots (JaVers Audit Logs)
+- **Collection**: `jv_snapshots`
+- **Reference Field**: Entity ID stored in `globalId` field (contains ObjectId of tracked entities)
+- **Purpose**: **JaVers audit log** - Stores version history/snapshots of entity changes for audit trail
+- **Volume**: 4.1M documents, 739.45 MB (data) + 336.24 MB (indexes) = **~1.08 GB total**
+- **Indexes**: 7 indexes (JaVers internal structure)
+- **Tracked Entities** (from `AuditLogEntityType`):
+    - `PromotionMeta` - Promotion campaign definitions
+    - `PromotionSettings` - Promotion settings
+    - `PromotionExpiryReminder` - Expiry reminder configurations
+    - `PromotionOrgConfiguration` - Organization-level promotion configurations
+
+**What JaVers Does**:
+- JaVers is a Java library that automatically tracks changes to annotated entities
+- Creates snapshots on every create/update/delete operation
+- Stores full entity state at each change point
+- Enables audit trail and version history retrieval
+
+**Archival Strategy**:
+
+1. **Archive with PromotionMeta** (Recommended):
+    - When archiving `PromotionMeta`, also archive related JaVers snapshots
+    - Query snapshots by entity ID (promotionId) stored in `globalId` field
+    - **Query Pattern**:
+   ```javascript
+   // MongoDB query to find snapshots for a specific PromotionMeta
+   db.jv_snapshots.find({
+     "globalId.entity": "com.capillary.promotionengine.bo.PromotionMeta",
+     "globalId.cdoId": ObjectId("<promotionId>")
+   })
+   ```
+
+2. **Date-Based Archival** (Alternative):
+    - Archive snapshots older than retention period (e.g., >3 years)
+    - Query by commit date stored in related `jv_commit` collection
+    - **Consideration**: May archive snapshots for entities that are still active
+
+3. **Retention Considerations**:
+    - **Compliance/Legal**: Audit logs may have legal retention requirements (e.g., 7 years)
+    - **Business Requirements**: May need audit trail for financial/compliance audits
+    - **Recommendation**: Archive snapshots **only after** confirming retention requirements
+    - **Alternative**: Keep audit logs longer than business data (e.g., archive promotions after 3 years, but keep audit logs for 7 years)
+
+4. **JaVers Collection Structure**:
+    - `jv_snapshots` - Entity snapshots (what we archive)
+    - `jv_commit` - Commit metadata (dates, authors) - linked via `commit_fk`
+    - `jv_global_id` - Entity references - linked via `globalId_fk`
+    - `jv_commit_property` - Commit properties (e.g., orgId) - linked via `commit_fk`
+    - `jv_head_id` - Head commit tracking (small, 1 document)
+
+5. **Archival Implementation**:
+   ```java
+   // Archive JaVers snapshots for a specific PromotionMeta
+   public void archiveJaversSnapshotsForPromotion(String promotionId) {
+       // 1. Find all snapshots for this PromotionMeta
+       Query snapshotQuery = new Query(
+           Criteria.where("globalId.entity")
+               .is("com.capillary.promotionengine.bo.PromotionMeta")
+               .and("globalId.cdoId").is(new ObjectId(promotionId))
+       );
+       
+       List<Document> snapshots = mongoTemplate.find(
+           snapshotQuery, Document.class, "jv_snapshots");
+       
+       // 2. Get related commits
+       Set<ObjectId> commitIds = snapshots.stream()
+           .map(s -> (ObjectId) s.get("commit_fk"))
+           .collect(Collectors.toSet());
+       
+       // 3. Archive snapshots, commits, and related data
+       // Move to archive collection or external storage
+   }
+   ```
+
+6. **Important Notes**:
+    - **Do NOT archive if compliance requires longer retention** - Check legal/compliance requirements first
+    - **Archive as a unit** - Archive all JaVers collections together (snapshots, commits, global_ids, commit_properties)
+    - **Test restoration** - Ensure archived audit logs can be restored if needed for audits
+    - **Consider separate retention** - Audit logs may need different retention than business data
+
+**Archival Query Patterns**:
+
+```java
+// Query snapshots by PromotionMeta ID
+Criteria.where("globalId.entity")
+    .is("com.capillary.promotionengine.bo.PromotionMeta")
+    .and("globalId.cdoId").in(promotionIds)
+
+// Query by commit date (for date-based archival)
+// Note: Requires join with jv_commit collection
+Criteria.where("commit_fk").in(
+    // Subquery: commits older than cutoff date
+    commitIdsFromDateQuery
+)
+```
+
+**Recommendation**:
+- **Option 1 (Recommended)**: Archive JaVers snapshots **only when archiving PromotionMeta**, and only after confirming compliance requirements allow it
+- **Option 2**: Keep audit logs longer (e.g., 7 years) while archiving business data (3 years)
+- **Option 3**: Archive audit logs separately based on commit date, independent of promotion archival
+
 ### Archival Priority Summary
 
 **High Priority** (Large Volume):
@@ -657,6 +760,9 @@ This section lists all collections that reference `PromotionMeta` (via `promotio
 14. **PromotionRedemptionFailureLog** - Failure logs
 15. **ExpiryReminderJob** - Job records
 16. **LoyaltyTargetEvent** - Event tracking (TTL managed)
+
+**Special Consideration** (Compliance-Dependent):
+17. **jv_snapshots** - 4.1M documents, ~1.08 GB - **Audit logs** - Archive only after confirming compliance/legal retention requirements. May need longer retention (e.g., 7 years) than business data (3 years).
 
 ### Archival Query Patterns
 
@@ -1036,6 +1142,167 @@ private void archiveToExternalStorage(Long orgId, ObjectId startId, ObjectId end
     - Alert on errors or performance degradation
     - Track estimated completion time
 
+### 4.3.1 Lock Contention and MongoDB Locking Behavior
+
+**MongoDB Locking Model**:
+- **WiredTiger Storage Engine** (default in MongoDB 3.2+): Uses **document-level locks**, not collection-level locks
+- **Lock Granularity**: Each document write operation acquires a lock only on the specific document being modified
+- **Concurrent Operations**: Multiple operations can proceed simultaneously as long as they target different documents
+- **Index Updates**: Index updates may require brief locks on index structures, but these are typically very short
+
+**Lock Contention Scenarios During Archival**:
+
+1. **Per-Promotion Processing (Smaller Chunks)**:
+    - **Advantage**: More targeted operations, processes one promotion at a time
+    - **Lock Behavior**:
+        - Locks are held only on documents being archived for that specific promotion
+        - Other promotions' documents remain unlocked and accessible
+        - Minimal contention with application reads/writes on other promotions
+    - **Risk**:
+        - If a single promotion has millions of documents, long-running batch operations may hold locks on many documents
+        - Application operations on the same promotion's documents may experience contention
+    - **Mitigation**:
+        - Process even within a promotion in smaller batches (1000-5000 documents)
+        - Add delays between batches to release locks periodically
+        - Use cursor-based pagination to process incrementally
+
+2. **Per-Batch Processing (Across Multiple Promotions)**:
+    - **Advantage**: Faster overall completion, processes multiple promotions in parallel
+    - **Lock Behavior**:
+        - Locks are held on documents across multiple promotions
+        - Higher potential for contention if application operations target same documents
+    - **Risk**:
+        - More documents locked simultaneously
+        - Higher chance of blocking application operations
+    - **Mitigation**:
+        - Limit batch size to reduce lock duration
+        - Use write concern `{w: 1}` to avoid waiting for replication
+        - Process during off-peak hours
+
+**Best Practices to Minimize Lock Contention**:
+
+1. **Batch Size Strategy**:
+   ```java
+   // Process in small batches with delays
+   int batchSize = 1000; // Start small
+   Thread.sleep(100); // 100ms delay between batches releases locks
+   ```
+    - **Smaller batches (500-1000)**: Shorter lock duration, less contention, more round trips
+    - **Larger batches (5000+)**: Longer lock duration, higher contention risk, fewer round trips
+    - **Recommendation**: Start with 1000, monitor contention, adjust based on DB load
+
+2. **Write Concern Settings**:
+   ```java
+   // Use write concern to reduce lock time
+   WriteConcern writeConcern = WriteConcern.ACKNOWLEDGED; // {w: 1}
+   // For archive inserts (non-critical), can use {w: 0} to avoid waiting
+   WriteConcern archiveWriteConcern = WriteConcern.UNACKNOWLEDGED; // {w: 0}
+   ```
+    - **`{w: 1}`**: Acknowledges write, doesn't wait for replication (recommended for archival)
+    - **`{w: 0}`**: Fire-and-forget, minimal lock time (use only for archive collection inserts)
+    - **`{w: "majority"}`**: Waits for majority replication (NOT recommended for archival - increases lock time)
+
+3. **Processing Strategy - Per Promotion vs Per Batch**:
+
+   **Option A: Process Per Promotion (Recommended for Large Promotions)**:
+   ```java
+   // Process one promotion at a time in batches
+   for (String promotionId : expiredPromotionIds) {
+       archivePromotionInBatches(orgId, promotionId, batchSize);
+       Thread.sleep(200); // Delay between promotions
+   }
+   ```
+    - **Pros**:
+        - Isolated operations per promotion
+        - Easier to track progress per promotion
+        - Lower contention (only one promotion's documents locked at a time)
+    - **Cons**:
+        - Slower overall completion if many promotions
+        - May take longer to archive all data
+
+   **Option B: Process Per Batch (Recommended for Many Small Promotions)**:
+   ```java
+   // Process multiple promotions in each batch
+   archiveBatchAcrossPromotions(orgId, expiredPromotionIds, batchSize);
+   ```
+    - **Pros**:
+        - Faster overall completion
+        - Better resource utilization
+    - **Cons**:
+        - More documents locked simultaneously
+        - Higher contention potential
+        - Harder to track per-promotion progress
+
+4. **Index Considerations**:
+    - **Ensure indexes exist** on query fields (`orgId`, `promotionId`, `validTill`, `_id`)
+    - **Index locks**: Brief locks on index structures during writes
+    - **Impact**: Minimal if indexes are well-designed
+    - **Avoid**: Dropping/rebuilding indexes during archival (causes collection-level locks)
+
+5. **Concurrent Processing Limits**:
+   ```java
+   // Limit concurrent archival operations
+   int maxConcurrentArchivals = 2; // Process max 2 promotions concurrently
+   Semaphore semaphore = new Semaphore(maxConcurrentArchivals);
+   
+   for (String promotionId : expiredPromotionIds) {
+       semaphore.acquire();
+       executorService.submit(() -> {
+           try {
+               archivePromotionInBatches(orgId, promotionId, batchSize);
+           } finally {
+               semaphore.release();
+           }
+       });
+   }
+   ```
+    - **Recommendation**: Limit to 1-2 concurrent archival operations per collection
+    - **Reason**: Prevents excessive lock contention across multiple promotions
+
+6. **Monitoring Lock Contention**:
+    - **MongoDB Metrics to Monitor**:
+        - `globalLock.currentQueue.total` - Queued operations waiting for locks
+        - `globalLock.activeClients.total` - Active client operations
+        - `wiredTiger.concurrentTransactions.write.available` - Available write tickets
+        - `wiredTiger.concurrentTransactions.write.out` - Write tickets in use
+    - **Application Metrics**:
+        - Average batch processing time
+        - Documents archived per second
+        - Application operation latency during archival
+
+**Answer to Your Question**:
+
+**Will there be lock contention when archival runs slowly in smaller chunks per promotion?**
+
+**Short Answer**: **Minimal contention** if implemented correctly.
+
+**Detailed Answer**:
+1. **Document-Level Locks**: MongoDB WiredTiger uses document-level locks, so only documents being archived are locked, not the entire collection
+2. **Smaller Chunks**: Processing in smaller chunks (1000 documents) per promotion means:
+    - **Shorter lock duration** per batch
+    - **Locks released frequently** (between batches)
+    - **Minimal overlap** with application operations
+3. **Per-Promotion Processing**: Processing one promotion at a time further reduces contention:
+    - Only one promotion's documents are locked at a time
+    - Application operations on other promotions proceed normally
+    - Even if application operations target the same promotion, locks are brief
+4. **Potential Contention Scenarios**:
+    - **Same Document**: If application tries to update a document being archived (rare, as expired promotions shouldn't be updated)
+    - **Index Updates**: Brief locks on index structures (minimal impact)
+    - **Large Batches**: If batch size is too large (5000+), locks held longer
+5. **Mitigation**:
+    - Use batch size 1000-2000 documents
+    - Add 100-200ms delays between batches
+    - Process during off-peak hours
+    - Use write concern `{w: 1}` (not `{w: "majority"}`)
+    - Monitor lock metrics and adjust batch size if needed
+
+**Recommendation**:
+- **Process per promotion in batches of 1000-2000 documents**
+- **Add 100-200ms delays between batches**
+- **Limit to 1-2 concurrent archival operations per collection**
+- **Monitor lock metrics and adjust batch size based on observed contention**
+
 ### 4.4 Sample Implementation Structure
 
 ```
@@ -1286,5 +1553,4 @@ The validation logic in `PromotionMetaManagementService.validatePromotionName()`
 - `PromotionOrgConfiguration.uniquePromotionNameConstraintEnabled` - Configuration flag
 - MongoDB TTL Indexes documentation
 - Spring Data MongoDB batch operations
-
 
