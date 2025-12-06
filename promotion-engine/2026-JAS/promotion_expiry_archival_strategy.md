@@ -44,7 +44,10 @@
     - [7.1 Key Metrics to Track](#71-key-metrics-to-track)
     - [7.2 Alerts](#72-alerts)
 - [8. Estimated Timeline](#8-estimated-timeline)
-- [9. References](#9-references)
+- [9. Validation Logic and Archival Impact](#9-validation-logic-and-archival-impact)
+    - [9.1 Promotion Name Uniqueness Validation](#91-promotion-name-uniqueness-validation)
+    - [9.2 Other Validation Considerations](#92-other-validation-considerations)
+- [10. References](#10-references)
 
 ---
 
@@ -1109,7 +1112,7 @@ public void restoreFromS3(String archiveKey) {
     // 1. Download from S3
     S3Object s3Object = s3Client.getObject(bucketName, archiveKey);
     List<CustomerIssuedPromotion> documents = parseJson(s3Object.getObjectContent());
-
+    
     // 2. Insert into MongoDB
     mongoTemplate.insertAll(documents, "CustomerIssuedPromotion");
 }
@@ -1160,11 +1163,128 @@ For 1.2B issued + 1.2B earned + codes:
 
 ---
 
-## 9. References
+## 9. Validation Logic and Archival Impact
+
+### 9.1 Promotion Name Uniqueness Validation
+
+**Question**: Will archiving `PromotionMeta` break validation logic like unique promotion names?
+
+**Answer**: **NO** - Archiving expired promotions will NOT break promotion name uniqueness validation.
+
+#### How Promotion Name Validation Works
+
+The validation logic in `PromotionMetaManagementService.validatePromotionName()` checks for duplicate promotion names using the following criteria:
+
+```java
+// Method: getActiveAndUnExpiredPromotionsWithPromotionNameAndNotId()
+// Query conditions:
+- orgId = <orgId>
+- name = <promotionName>
+- active = true
+- startDate <= now
+- endDate >= now  // KEY: Only checks UNEXPIRED promotions
+- id != <promotionId>  // For updates, excludes current promotion
+```
+
+**Key Points**:
+1. **Only Active Promotions**: Validation checks `active = true`
+2. **Only Unexpired Promotions**: Validation checks `endDate >= now` (promotion must not be expired)
+3. **Organization-Scoped**: Validation is per organization (`orgId`)
+4. **Configurable**: Controlled by `PromotionOrgConfiguration.uniquePromotionNameConstraintEnabled` (default: `true`)
+
+#### Why Archiving Won't Break Validation
+
+1. **Expired Promotions Are Already Excluded**:
+    - The validation query requires `endDate >= now`
+    - Expired promotions (archived after >3 years) have `endDate < now`
+    - Therefore, they are **already excluded** from the validation check
+
+2. **Archive Collection Separation**:
+    - If using archive collection strategy, archived promotions are in a separate collection
+    - The validation query runs against the main `PromotionMeta` collection
+    - Archived promotions won't be found by the validation query
+
+3. **Soft Delete Strategy**:
+    - If using soft delete with `archived = true` flag, add filter: `.and("archived").ne(true)` to validation query
+    - This ensures archived promotions are excluded from validation
+
+#### Validation Scenarios
+
+**Scenario 1: Creating New Promotion**
+- Checks for active, unexpired promotions with same name
+- Archived/expired promotions are not considered
+- **Result**: ✅ Safe to archive expired promotions
+
+**Scenario 2: Updating Promotion Name**
+- Same validation as creation
+- Excludes current promotion being updated
+- **Result**: ✅ Safe to archive expired promotions
+
+**Scenario 3: Extending Expiry Date**
+- When extending `endDate`, validation re-checks for duplicates
+- Only checks active, unexpired promotions
+- **Result**: ✅ Safe to archive expired promotions
+
+**Scenario 4: Reactivating Promotion**
+- When setting `active = true`, validation checks for duplicates
+- Only checks other active, unexpired promotions
+- **Result**: ✅ Safe to archive expired promotions
+
+#### Important Considerations
+
+1. **If Extending Expiry of Archived Promotion**:
+    - If you restore an archived promotion and extend its expiry date, it will be checked against current active promotions
+    - This is expected behavior and maintains data integrity
+
+2. **Database Index**:
+    - The index `{'orgId': 1, 'name': 1}` is **NOT unique** (see `PromotionMeta` class)
+    - Uniqueness is enforced at application level, not database level
+    - This allows multiple promotions with same name if they are expired/inactive
+
+3. **Configuration Flag**:
+    - `uniquePromotionNameConstraintEnabled` can be disabled per organization
+    - If disabled, no validation is performed
+    - Archival has no impact when validation is disabled
+
+#### Recommended Approach
+
+**For Archive Collection Strategy**:
+- No changes needed - archived promotions are in separate collection
+- Validation queries only run against main collection
+
+**For Soft Delete Strategy**:
+- Update validation query to exclude archived promotions:
+  ```java
+  // Add to getActiveAndUnExpiredPromotionsWithPromotionNameAndNotId()
+  criteria.add(Criteria.where("archived").ne(true));
+  ```
+- This ensures archived promotions don't interfere with validation
+
+**For External Storage Strategy**:
+- No changes needed - archived promotions are removed from database
+- Validation queries won't find them
+
+### 9.2 Other Validation Considerations
+
+**Max Active Promotions Limit**:
+- `PromotionOrgConfiguration.maxActivePromotions` limits active promotions per org
+- Archiving expired promotions **helps** by reducing active promotion count
+- No negative impact expected
+
+**Campaign ID Validation**:
+- Campaign ID validation is separate from promotion name
+- Archiving has no impact on campaign-related validations
+
+---
+
+## 10. References
 
 - `AbstractExpiryDateChangeDao` - Batch processing pattern
 - `ExpiryDateChangeJobService` - Job orchestration
 - `PromotionMeta.hasExpired()` - Expiry check logic
+- `PromotionMetaManagementService.validatePromotionName()` - Promotion name uniqueness validation
+- `PromotionOrgConfiguration.uniquePromotionNameConstraintEnabled` - Configuration flag
 - MongoDB TTL Indexes documentation
 - Spring Data MongoDB batch operations
+
 
