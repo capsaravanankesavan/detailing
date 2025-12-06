@@ -1,5 +1,53 @@
 # Promotion Expiry and Archival Strategy
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Current Data Volume](#current-data-volume)
+    - [Primary Collections (High Volume)](#primary-collections-high-volume)
+    - [Secondary Collections (Moderate Volume)](#secondary-collections-moderate-volume)
+    - [Low Volume Collections](#low-volume-collections)
+    - [Summary Statistics](#summary-statistics)
+- [1. Expiry Maintenance at Different Levels](#1-expiry-maintenance-at-different-levels)
+    - [1.1 Meta Level (PromotionMeta)](#11-meta-level-promotionmeta)
+    - [1.2 Issue Level (CustomerIssuedPromotion)](#12-issue-level-customerissuedpromotion)
+    - [1.3 Earn Level (CustomerEarnedPromotion)](#13-earn-level-customerearnedpromotion)
+    - [1.4 Code Level (CodeBasedPromotion)](#14-code-level-codebasedpromotion)
+    - [1.5 Expiry Relationships Summary](#15-expiry-relationships-summary)
+    - [1.6 Collections Referencing PromotionMeta](#16-collections-referencing-promotionmeta)
+        - [Primary Collections (Already Documented)](#primary-collections-already-documented)
+        - [Secondary Collections (Require Archival Consideration)](#secondary-collections-require-archival-consideration)
+        - [Archival Priority Summary](#archival-priority-summary)
+        - [Archival Query Patterns](#archival-query-patterns)
+- [2. Querying Expired Promotions](#2-querying-expired-promotions)
+    - [2.1 Query Patterns](#21-query-patterns)
+    - [2.2 Efficient Query Strategies](#22-efficient-query-strategies)
+- [3. Archival Strategies Without DB Load](#3-archival-strategies-without-db-load)
+    - [3.1 Batch Processing with Cursor-Based Pagination](#31-batch-processing-with-cursor-based-pagination)
+    - [3.2 Strategy 1: Move to Archive Collection](#32-strategy-1-move-to-archive-collection)
+    - [3.3 Strategy 2: Soft Delete with Archive Flag](#33-strategy-2-soft-delete-with-archive-flag)
+    - [3.4 Strategy 3: TTL Index with Delayed Archive](#34-strategy-3-ttl-index-with-delayed-archive)
+    - [3.5 Strategy 4: Partitioned Collections by Year](#35-strategy-4-partitioned-collections-by-year)
+    - [3.6 Strategy 5: External Archive Storage](#36-strategy-5-external-archive-storage)
+- [4. Recommended Archival Approach](#4-recommended-archival-approach)
+    - [4.1 Hybrid Strategy](#41-hybrid-strategy)
+    - [4.2 Implementation Checklist](#42-implementation-checklist)
+    - [4.3 Performance Optimizations](#43-performance-optimizations)
+    - [4.4 Sample Implementation Structure](#44-sample-implementation-structure)
+- [5. Query Modifications for Archived Data](#5-query-modifications-for-archived-data)
+    - [5.1 Application Query Updates](#51-application-query-updates)
+    - [5.2 Index Updates](#52-index-updates)
+- [6. Rollback Strategy](#6-rollback-strategy)
+    - [6.1 If Using Archive Collection](#61-if-using-archive-collection)
+    - [6.2 If Using External Storage](#62-if-using-external-storage)
+- [7. Monitoring and Metrics](#7-monitoring-and-metrics)
+    - [7.1 Key Metrics to Track](#71-key-metrics-to-track)
+    - [7.2 Alerts](#72-alerts)
+- [8. Estimated Timeline](#8-estimated-timeline)
+- [9. References](#9-references)
+
+---
+
 ## Overview
 This document details how expiry is maintained at different levels (Meta, Issue, Earn, Code) and provides strategies for archiving expired promotions (>3 years) without impacting database performance.
 
@@ -1014,13 +1062,13 @@ findAllByOrgIdAndCustomerIdAndValidTillGreaterThanAndActiveIsTrue(orgId, custome
 
 // After (if using soft delete)
 findAllByOrgIdAndCustomerIdAndValidTillGreaterThanAndActiveIsTrueAndArchivedIsFalse(
-        orgId, customerId, date);
+    orgId, customerId, date);
 
 // Or update query builder
 BooleanExpression conditions = QCustomerIssuedPromotion.customerIssuedPromotion
-        .orgId.eq(orgId)
-        .and(QCustomerIssuedPromotion.customerIssuedPromotion.active.isTrue())
-        .and(QCustomerIssuedPromotion.customerIssuedPromotion.archived.isFalse());
+    .orgId.eq(orgId)
+    .and(QCustomerIssuedPromotion.customerIssuedPromotion.active.isTrue())
+    .and(QCustomerIssuedPromotion.customerIssuedPromotion.archived.isFalse());
 ```
 
 ### 5.2 Index Updates
@@ -1040,14 +1088,14 @@ Add compound indexes including `archived` field:
 // Restore from archive
 public void restoreFromArchive(Long orgId, Date restoreDate) {
     Query archiveQuery = new Query(
-            Criteria.where("orgId").is(orgId)
-                    .and("archivedAt").gte(restoreDate)
+        Criteria.where("orgId").is(orgId)
+            .and("archivedAt").gte(restoreDate)
     );
-
-    List<CustomerIssuedPromotion> toRestore =
-            mongoTemplate.find(archiveQuery, CustomerIssuedPromotion.class,
-                    "CustomerIssuedPromotion_Archive");
-
+    
+    List<CustomerIssuedPromotion> toRestore = 
+        mongoTemplate.find(archiveQuery, CustomerIssuedPromotion.class, 
+                          "CustomerIssuedPromotion_Archive");
+    
     mongoTemplate.insertAll(toRestore, "CustomerIssuedPromotion");
     log.info("Restored {} documents from archive", toRestore.size());
 }
