@@ -48,7 +48,11 @@
 - [9. Validation Logic and Archival Impact](#9-validation-logic-and-archival-impact)
     - [9.1 Promotion Name Uniqueness Validation](#91-promotion-name-uniqueness-validation)
     - [9.2 Other Validation Considerations](#92-other-validation-considerations)
-- [10. References](#10-references)
+- [10. Implementation Tasking and Timeline](#10-implementation-tasking-and-timeline)
+    - [10.1 High-Level Approach](#101-high-level-approach)
+    - [10.2 Implementation Phases](#102-implementation-phases)
+    - [10.3 Summary](#103-summary)
+- [11. References](#11-references)
 
 ---
 
@@ -1544,7 +1548,97 @@ The validation logic in `PromotionMetaManagementService.validatePromotionName()`
 
 ---
 
-## 10. References
+## 10. Implementation Tasking and Timeline
+
+### 10.1 High-Level Approach
+
+**Architecture**: Job-based processing with resume capability across 7 pods in ASIA cluster
+- **Resiliency**: Jobs can resume across pod restarts
+- **Control**: Configurable parallel job execution limits
+- **Tracking**: Job status tracked in MongoDB collection
+
+**Job Types**:
+1. **Per-Promotion Archival**: Archives one promotion at a time (issued, earned, code, and related collections)
+2. **Per-Promotion Restoration**: Restores archived data for a specific promotion
+3. **Non-Promotion Archival**: Archives `CartEvaluation` by date (>3 years old)
+4. **Non-Promotion Restoration**: Restores `CartEvaluation` for a date range
+
+### 10.2 Implementation Phases
+
+#### Phase 1: Primary Collections
+
+**Phase 1.1: Implementation (15 days)**
+
+| Task | Days | Description |
+|------|------|-------------|
+| Design & Test Cases | 2d | Detailed design review and test case preparation |
+| Job Management Framework | 2d | Job orchestration, resume capability, status tracking, parallel execution control |
+| Per-Promotion Archive Job | 7d | Archive job implementation |
+| ├─ Validation Logic | 1d | Validate promotion ready to archive (check earned promotions expiry) |
+| ├─ Primary Collections | 3d | Archive issued, earned, code, meta collections |
+| └─ Secondary Collections | 3d | Archive redemption, summary, preferences, and related collections |
+| Per-Promotion Restore Job | 4d | Restore job for specific promotion (earned, issued, redemption summary) |
+
+**Phase 1.1 Total: 15 days**
+
+**Phase 1.2: Rollout (7 days)**
+
+| Task | Days | Description |
+|------|------|-------------|
+| Initial Archive Rollout | 5d | Monitor and run initial archival for longer hours |
+| Daily Schedule Setup | 2d | Configure daily scheduled archival jobs |
+
+**Phase 1.2 Total: 7 days**
+
+**Phase 1 Grand Total: 22 days**
+
+#### Phase 2: CartEvaluation Archival (6 days)
+
+| Task | Days | Description |
+|------|------|-------------|
+| CartEvaluation Archive Job | 4d | Archive `CartEvaluation` collection by date (>3 years) |
+| CartEvaluation Restore Job | 2d | Restore `CartEvaluation` for date range |
+
+**Phase 2 Total: 6 days**
+
+#### Phase 3: Audit Logs (TBD)
+
+- Archive `jv_snapshots` and related JaVers collections
+- **Note**: Pending compliance/legal retention requirements review
+
+#### Phase 4: Future Enhancements (TBD)
+
+- Migrate to separate `pe-job` service for archival operations
+- Implement external archive storage (S3/HDFS)
+
+### 10.3 Summary
+
+**Total Estimated Effort**:
+- **Phase 1**: **22 days** (Primary collections)
+    - **Implementation**: 15 days
+    - **Rollout**: 7 days
+- **Phase 2**: **6 days** (CartEvaluation)
+- **Phase 3**: TBD (Audit logs - compliance dependent)
+- **Phase 4**: TBD (Future enhancements)
+
+**Total (Phases 1-2)**: **28 days**
+
+**Key Deliverables**:
+- ✅ Job management framework with resume capability
+- ✅ Per-promotion archival and restoration
+- ✅ CartEvaluation archival by date
+- ✅ Daily scheduled archival jobs
+- ✅ Monitoring and status tracking
+
+**Critical Success Factors**:
+- Job resume capability for production resilience
+- Validation before archival (check earned promotions expiry)
+- Batch processing with rate limiting (see Section 4.3.1)
+- Monitoring and alerting for job execution
+
+---
+
+## 11. References
 
 - `AbstractExpiryDateChangeDao` - Batch processing pattern
 - `ExpiryDateChangeJobService` - Job orchestration
