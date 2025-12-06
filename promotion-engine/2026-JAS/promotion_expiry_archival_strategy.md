@@ -4,11 +4,73 @@
 This document details how expiry is maintained at different levels (Meta, Issue, Earn, Code) and provides strategies for archiving expired promotions (>3 years) without impacting database performance.
 
 ## Current Data Volume
-- **Issued Promotions**: 1.2B documents (~50GB)
-- **Earned Promotions**: 1.2B documents (~65GB)
-- **Cart Evaluations**: 591M documents (~1.79TB)
 
-**Goal**: Archive promotions (issued, earned, code) expired > 3 years.
+This section provides the current data volume statistics from the asiacrm MongoDB cluster (emf) as of the last analysis. These numbers help prioritize archival efforts and estimate storage requirements.
+
+### Primary Collections (High Volume)
+
+| Collection | Documents | Storage Size | Avg Doc Size | Index Size | Total Size (Data + Index) |
+|------------|-----------|-------------|--------------|------------|---------------------------|
+| **cartEvaluation** | 630M | 1.95 TB | 12.70 kB | 57.68 GB | **~2.01 TB** |
+| **customerEarnedPromotion** | 1.4B | 71.87 GB | 451 B | 161.66 GB | **~233.53 GB** |
+| **customerIssuedPromotion** | 1.3B | 55.39 GB | 370 B | 151.47 GB | **~206.86 GB** |
+| **promotionRedemption** | 138M | 36.28 GB | 1.11 kB | 16.80 GB | **~53.08 GB** |
+| **restrictionLevelRedemptionSummary** | 89M | 4.15 GB | 266 B | 3.48 GB | **~7.63 GB** |
+
+### Secondary Collections (Moderate Volume)
+
+| Collection | Documents | Storage Size | Avg Doc Size | Index Size | Total Size (Data + Index) |
+|------------|-----------|-------------|--------------|------------|---------------------------|
+| **codeBasedPromotion** | 11M | 665.13 MB | 368 B | 1.09 GB | **~1.76 GB** |
+| **customerPromotionPreference** | 16M | 984.78 MB | 323 B | 1.19 GB | **~2.17 GB** |
+| **promotionMeta** | 993K | 167.02 MB | 969 B | 78.57 MB | **~245.59 MB** |
+| **promotionSummary** | 764K | 42.52 MB | 203 B | 37.27 MB | **~79.79 MB** |
+| **loyaltyTargetEvent** | 432K | 45.36 MB | 230 B | 48.50 MB | **~93.86 MB** |
+| **promotionRedemptionFailureLog** | 176K | 55.03 MB | 1.36 kB | 13.64 MB | **~68.67 MB** |
+| **codeBasedPromotionMeta** | 65K | 8.99 MB | 458 B | 3.25 MB | **~12.24 MB** |
+| **cartEvaluationReservation** | 62 | 1.13 MB | 510 B | 1.24 MB | **~2.37 MB** |
+
+### Low Volume Collections
+
+| Collection | Documents | Storage Size | Notes |
+|------------|-----------|--------------|-------|
+| **promotionExpiryReminder** | 185 | 126.98 kB | Configuration data |
+| **expiryReminderJob** | 3K | 184.32 kB | Job execution records |
+| **expiryReminderBatchJob** | 293 | 81.92 kB | Batch job records |
+| **expiryDateChangeJob** | 8.6K | 876.54 kB | Expiry date update jobs |
+| **codeBasedPromotionErrorLog** | 91 | 45.06 kB | Error logs |
+
+### Summary Statistics
+
+**Total Collections Analyzed**: 26
+
+**Top 5 Collections by Storage Size**:
+1. **cartEvaluation** - 1.95 TB (largest, critical for archival)
+2. **customerEarnedPromotion** - 71.87 GB
+3. **customerIssuedPromotion** - 55.39 GB
+4. **promotionRedemption** - 36.28 GB
+5. **restrictionLevelRedemptionSummary** - 4.15 GB
+
+**Top 5 Collections by Document Count**:
+1. **customerEarnedPromotion** - 1.4B documents
+2. **customerIssuedPromotion** - 1.3B documents
+3. **cartEvaluation** - 630M documents
+4. **promotionRedemption** - 138M documents
+5. **restrictionLevelRedemptionSummary** - 89M documents
+
+**Total Estimated Storage** (Primary + Secondary Collections):
+- **Data**: ~2.16 TB
+- **Indexes**: ~400 GB
+- **Total**: **~2.56 TB**
+
+**Goal**: Archive promotions (issued, earned, code) and related collections expired > 3 years.
+
+**Archival Priority** (based on volume):
+1. **cartEvaluation** - 630M documents, 1.95 TB (highest priority due to size)
+2. **customerEarnedPromotion** - 1.4B documents, 71.87 GB
+3. **customerIssuedPromotion** - 1.3B documents, 55.39 GB
+4. **promotionRedemption** - 138M documents, 36.28 GB
+5. **restrictionLevelRedemptionSummary** - 89M documents, 4.15 GB
 
 ---
 
@@ -372,6 +434,203 @@ findByOrgIdAndCustomerIdAndValidTillDateGreaterThanAndActiveIsTrue(
 - For earned promotions, also consider checking `PromotionMeta.endDate` to catch edge cases
 - Meta expiry (`endDate < archiveCutoffDate`) is a good indicator, but instance-level expiry is the definitive source
 - All levels can be archived independently, but meta expiry is a strong signal for bulk archival
+
+---
+
+## 1.6 Collections Referencing PromotionMeta
+
+This section lists all collections that reference `PromotionMeta` (via `promotionId` or `promotionMetaId`) and their archival considerations.
+
+### Primary Collections (Already Documented)
+
+1. **PromotionMeta** - Campaign definition (Section 1.1)
+2. **CustomerIssuedPromotion** - Issued promotions (Section 1.2)
+3. **CustomerEarnedPromotion** - Earned promotions (Section 1.3)
+4. **CodeBasedPromotion** - Promo codes (Section 1.4)
+
+### Secondary Collections (Require Archival Consideration)
+
+#### 5. PromotionRedemption
+- **Collection**: `PromotionRedemption`
+- **Reference Field**: `promotionId` (String)
+- **Purpose**: Records of promotion redemptions/usage
+- **Indexes**: `{'orgId': 1, 'promotionId': 1, 'customerId': 1, 'redemptionDate': -1}`
+- **Archival Strategy**:
+    - Archive based on `redemptionDate < archiveCutoffDate` (e.g., >3 years old)
+    - Can also filter by `promotionId` if archiving specific expired promotions
+    - **Volume**: High (one per redemption transaction)
+    - **Retention**: Consider regulatory/compliance requirements for transaction history
+
+#### 6. RestrictionLevelRedemptionSummary
+- **Collection**: `RestrictionLevelRedemptionSummary`
+- **Reference Field**: `promotionId` (String)
+- **Purpose**: KPI summaries for promotion restrictions (cart/customer/earn level)
+- **Indexes**: `{'orgId': 1, 'promotionId': 1, 'level': 1, 'customerId': 1}`
+- **Archival Strategy**:
+    - Archive based on `validTill < archiveCutoffDate` (expired restriction periods)
+    - Can also filter by `promotionId` for expired promotions
+    - **Volume**: Medium (summary data, less frequent)
+    - **Retention**: May need for historical KPI analysis
+
+#### 7. CustomerPromotionPreference
+- **Collection**: `CustomerPromotionPreference`
+- **Reference Field**: `promotionId` (String)
+- **Purpose**: Customer preferences for promotions (e.g., opt-in/opt-out)
+- **Indexes**: `{'orgId': 1, 'customerId': 1, 'promotionId': 1, 'earnId': 1}` (unique)
+- **Archival Strategy**:
+    - Archive when associated promotion is archived (via `promotionId`)
+    - Can use `lastUpdatedOn < archiveCutoffDate` as secondary filter
+    - **Volume**: Low to medium (one per customer-promotion preference)
+    - **Retention**: May be needed for preference history
+
+#### 8. CartEvaluation
+- **Collection**: `CartEvaluation`
+- **Reference Field**: `promotionId` (embedded in `appliedPromotions` map via `CartEvaluationPromotionDetails`)
+- **Purpose**: Cart evaluation results with applied promotions
+- **Indexes**: `{'orgId': 1, 'customerId': 1}`, `{'attribution.lastUpdatedOn': 1}`
+- **Archival Strategy**:
+    - Archive based on `attribution.lastUpdatedOn < archiveCutoffDate` or `validTillTime < archiveCutoffDate`
+    - Filter by `promotionId` in nested `appliedPromotions` map if needed
+    - **Volume**: Very High (591M documents, ~1.79TB) - **HIGHEST PRIORITY**
+    - **Retention**: Consider shorter retention (e.g., 1-2 years) due to size
+    - **Note**: Already mentioned in Current Data Volume section
+
+#### 9. PromotionExpiryReminder
+- **Collection**: `PromotionExpiryReminder`
+- **Reference Field**: `promotionId` (String)
+- **Purpose**: Configuration for sending expiry reminders for promotions
+- **Indexes**: None specific to promotionId
+- **Archival Strategy**:
+    - Archive when associated promotion is archived (via `promotionId`)
+    - Can also filter by `active = false` and old `attribution.lastUpdatedOn`
+    - **Volume**: Low (one per promotion with reminder configured)
+    - **Retention**: Can archive immediately when promotion expires
+
+#### 10. CodeBasedPromotionMeta
+- **Collection**: `CodeBasedPromotionMeta`
+- **Reference Field**: `promotionId` (String), `metaId` (String - references CodeBasedPromotionMeta itself)
+- **Purpose**: Metadata for code-based promotion creation (bulk code generation jobs)
+- **Indexes**: `{'orgId': 1, 'promotionId': 1}`
+- **Archival Strategy**:
+    - Archive when associated promotion is archived (via `promotionId`)
+    - Can filter by `attribution.lastUpdatedOn < archiveCutoffDate`
+    - **Volume**: Low (one per code generation job)
+    - **Retention**: Can archive after code generation is complete and promotion expires
+
+#### 11. PromotionSummary
+- **Collection**: `PromotionSummary`
+- **Reference Field**: `promotionId` (String) - unique per promotion
+- **Purpose**: Aggregated statistics for promotions (issued count, redeemed count, etc.)
+- **Indexes**: `{'orgId': 1, 'promotionId': 1}` (unique)
+- **Archival Strategy**:
+    - Archive when associated promotion is archived (via `promotionId`)
+    - Can use `lastRedeemed` or `lastEarned < archiveCutoffDate` as filters
+    - **Volume**: Low (one per promotion)
+    - **Retention**: May be needed for historical analytics - consider longer retention
+
+#### 12. CodeBasedPromotionErrorLog
+- **Collection**: `CodeBasedPromotionErrorLog`
+- **Reference Field**: `promotionId` (String), `metaId` (String)
+- **Purpose**: Error logs for code generation failures
+- **Indexes**: `{'orgId': 1, 'metaId': 1}`, `{'orgId': 1, 'promoCode': 1}`
+- **Archival Strategy**:
+    - Archive when associated promotion is archived (via `promotionId`)
+    - Can use creation date if available
+    - **Volume**: Low to medium (errors during code generation)
+    - **Retention**: Can archive after code generation is complete
+
+#### 13. PromotionRedemptionFailureLog
+- **Collection**: `PromotionRedemptionFailureLog`
+- **Reference Field**: `promotionId` (embedded in `promotionRedemptions` list)
+- **Purpose**: Logs of failed redemption attempts
+- **Indexes**: `{'requestId': 1}`, `{'transactionIdentifier': 1}`
+- **Archival Strategy**:
+    - Archive based on `eventTime < archiveCutoffDate`
+    - Filter by `promotionId` in nested `promotionRedemptions` if needed
+    - **Volume**: Low to medium (only failed redemptions)
+    - **Retention**: Can archive after investigation period (e.g., 1 year)
+
+#### 14. ExpiryReminderJob
+- **Collection**: `ExpiryReminderJob`
+- **Reference Field**: `promotionId` (String)
+- **Purpose**: Job execution records for expiry reminder processing
+- **Indexes**: None specific
+- **Archival Strategy**:
+    - Archive based on `createdTime < archiveCutoffDate`
+    - Can filter by `promotionId` for expired promotions
+    - **Volume**: Low (job execution records)
+    - **Retention**: Can archive after job completion (short retention)
+
+#### 15. CartEvaluationReservation
+- **Collection**: `CartEvaluationReservation`
+- **Reference Field**: None directly, but related to `CartEvaluation` (which has promotionId)
+- **Purpose**: Reservation/locking mechanism for cart evaluations
+- **Indexes**: `{'orgId': 1, 'customerId': 1, 'sessionId': 1}`, TTL index on `validTillDateTime`
+- **Archival Strategy**:
+    - Uses TTL index - automatically expires based on `validTillDateTime`
+    - No direct promotionId reference, but can archive based on `validTillDateTime < archiveCutoffDate`
+    - **Volume**: Medium (one per cart evaluation session)
+    - **Retention**: Short-term (TTL handles cleanup)
+
+#### 16. LoyaltyTargetEvent
+- **Collection**: `LoyaltyTargetEvent`
+- **Reference Field**: None directly, but `targetEventId` may reference earned promotions
+- **Purpose**: Tracks loyalty target events for earned promotions
+- **Indexes**: `{'orgId': 1, 'customerId': 1, 'targetEventId': 1}` (unique), TTL on `createdOn`
+- **Archival Strategy**:
+    - Uses TTL index - automatically expires
+    - No direct promotionId, but related to earned promotions
+    - **Volume**: Low to medium
+    - **Retention**: Short-term (TTL handles cleanup)
+
+### Archival Priority Summary
+
+**High Priority** (Large Volume):
+1. **CartEvaluation** - 591M documents (~1.79TB) - **CRITICAL**
+2. **CustomerIssuedPromotion** - 1.2B documents (~50GB)
+3. **CustomerEarnedPromotion** - 1.2B documents (~65GB)
+4. **PromotionRedemption** - High volume (transactional data)
+
+**Medium Priority** (Moderate Volume):
+5. **CodeBasedPromotion** - Moderate volume
+6. **RestrictionLevelRedemptionSummary** - Summary data
+7. **CartEvaluationReservation** - Session data (TTL managed)
+
+**Low Priority** (Small Volume, Can Archive with Promotion):
+8. **PromotionMeta** - One per campaign
+9. **PromotionSummary** - One per promotion
+10. **CustomerPromotionPreference** - One per customer-promotion
+11. **PromotionExpiryReminder** - One per promotion with reminder
+12. **CodeBasedPromotionMeta** - One per code generation job
+13. **CodeBasedPromotionErrorLog** - Error logs
+14. **PromotionRedemptionFailureLog** - Failure logs
+15. **ExpiryReminderJob** - Job records
+16. **LoyaltyTargetEvent** - Event tracking (TTL managed)
+
+### Archival Query Patterns
+
+For collections with direct `promotionId` reference:
+```java
+// Archive by promotionId (when promotion is expired)
+Criteria.where("orgId").is(orgId)
+    .and("promotionId").in(expiredPromotionIds)
+```
+
+For collections with date-based archival:
+```java
+// Archive by date (e.g., redemptionDate, lastUpdatedOn)
+Criteria.where("orgId").is(orgId)
+    .and("redemptionDate").lt(archiveCutoffDate)
+```
+
+For nested promotionId (CartEvaluation):
+```java
+// Archive CartEvaluation with expired promotions
+// Note: Requires checking nested appliedPromotions map
+Criteria.where("orgId").is(orgId)
+    .and("attribution.lastUpdatedOn").lt(archiveCutoffDate)
+    // Additional filter needed for promotionId in nested structure
+```
 
 ---
 
@@ -755,13 +1014,13 @@ findAllByOrgIdAndCustomerIdAndValidTillGreaterThanAndActiveIsTrue(orgId, custome
 
 // After (if using soft delete)
 findAllByOrgIdAndCustomerIdAndValidTillGreaterThanAndActiveIsTrueAndArchivedIsFalse(
-    orgId, customerId, date);
+        orgId, customerId, date);
 
 // Or update query builder
 BooleanExpression conditions = QCustomerIssuedPromotion.customerIssuedPromotion
-    .orgId.eq(orgId)
-    .and(QCustomerIssuedPromotion.customerIssuedPromotion.active.isTrue())
-    .and(QCustomerIssuedPromotion.customerIssuedPromotion.archived.isFalse());
+        .orgId.eq(orgId)
+        .and(QCustomerIssuedPromotion.customerIssuedPromotion.active.isTrue())
+        .and(QCustomerIssuedPromotion.customerIssuedPromotion.archived.isFalse());
 ```
 
 ### 5.2 Index Updates
@@ -781,14 +1040,14 @@ Add compound indexes including `archived` field:
 // Restore from archive
 public void restoreFromArchive(Long orgId, Date restoreDate) {
     Query archiveQuery = new Query(
-        Criteria.where("orgId").is(orgId)
-            .and("archivedAt").gte(restoreDate)
+            Criteria.where("orgId").is(orgId)
+                    .and("archivedAt").gte(restoreDate)
     );
-    
-    List<CustomerIssuedPromotion> toRestore = 
-        mongoTemplate.find(archiveQuery, CustomerIssuedPromotion.class, 
-                          "CustomerIssuedPromotion_Archive");
-    
+
+    List<CustomerIssuedPromotion> toRestore =
+            mongoTemplate.find(archiveQuery, CustomerIssuedPromotion.class,
+                    "CustomerIssuedPromotion_Archive");
+
     mongoTemplate.insertAll(toRestore, "CustomerIssuedPromotion");
     log.info("Restored {} documents from archive", toRestore.size());
 }
@@ -802,7 +1061,7 @@ public void restoreFromS3(String archiveKey) {
     // 1. Download from S3
     S3Object s3Object = s3Client.getObject(bucketName, archiveKey);
     List<CustomerIssuedPromotion> documents = parseJson(s3Object.getObjectContent());
-    
+
     // 2. Insert into MongoDB
     mongoTemplate.insertAll(documents, "CustomerIssuedPromotion");
 }
