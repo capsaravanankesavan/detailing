@@ -78,9 +78,14 @@ We implemented a **lightweight cache** specifically for expiry filtering using a
     - `recordStats()` - For monitoring cache performance
 
 **Key Methods**:
-- `getCouponSeriesEntityForExpiry(int orgId, int couponSeriesId)` - Get single `CouponSeriesEntityForExpiry`
-- `getCouponSeriesEntitiesForExpiry(List<CouponSeriesKey> keys)` - Batch get
+- `getCouponSeriesEntityForExpiry(int orgId, int couponSeriesId)` - Get single `CouponSeriesEntityForExpiry` (O(1) cache lookup)
+- `getCouponSeriesEntitiesForExpiry(List<CouponSeriesKey> keys)` - Batch get (uses `getAll()` to load missing entries from cache loader)
 - `invalidateCouponSeriesEntityForExpiry(CouponSeriesKey)` - Invalidate cache entry
+
+**Note on `getCouponSeriesEntitiesForExpiry()`**:
+- Uses `getAll()` instead of `getAllPresent()` to ensure missing entries are loaded from cache loader
+- This method is used to warm the cache before individual lookups
+- After warming, individual lookups via `getCouponSeriesEntityForExpiry()` are fast O(1) cache hits
 
 ### 2. Lightweight Service Methods
 
@@ -143,17 +148,35 @@ private List<Coupon> filterExpiredCoupons(int orgId, Date minExpiryDate, List<Co
 #### After:
 ```java
 private List<Coupon> filterExpiredCoupons(int orgId, Date minExpiryDate, List<CouponEntity> couponEntities) {
-    // Use lightweight cache to create coupons for filtering
+    // Use lightweight cache to create coupons for filtering (expiry dates not calculated yet)
+    // Bulk load all ExpiryInfo objects (warms the cache) and create coupons
     List<Coupon> coupons = prepareCouponsFromEntityForExpiryFilter(orgId, couponEntities);
+    
     couponExpiryService.updateBulkExpiryDates(coupons);
+    
+    // Calculate expiry dates using ExpiryInfo from cache (cache is already warmed, so O(1) lookup)
+    for (Coupon coupon : coupons) {
+        CouponImpl couponImpl = (CouponImpl) coupon;
+        try {
+            CouponSeriesEntityForExpiry expiryInfo = 
+                    m_couponSeriesEntityForExpiryCacheManager.getCouponSeriesEntityForExpiry(
+                            orgId, couponImpl.getCouponEntity().getCouponSeriesId());
+            if (expiryInfo != null) {
+                couponImpl.getExpiryDate(expiryInfo);
+            }
+        } catch (Exception e) {
+            logger.debug("could not get expiry info from cache for coupon series id {}", 
+                    couponImpl.getCouponEntity().getCouponSeriesId(), e);
+        }
+    }
+    
     List<Coupon> filteredCoupons = coupons.stream()
             .filter((coupon) -> coupon.getExpiryDate().after(minExpiryDate))
             .collect(Collectors.toList());
 
     // Sort filtered coupons before setting code level redemptions
     if (filteredCoupons != null && filteredCoupons.size() > 1) {
-        filteredCoupons = filteredCoupons.stream()
-                .sorted(Comparator.comparing(Coupon::getExpiryDate))
+        filteredCoupons = filteredCoupons.stream().sorted(Comparator.comparing(Coupon::getExpiryDate))
                 .collect(Collectors.toList());
     }
 
@@ -164,10 +187,12 @@ private List<Coupon> filterExpiredCoupons(int orgId, Date minExpiryDate, List<Co
         for (Coupon coupon : filteredCoupons) {
             try {
                 CouponImpl couponImpl = (CouponImpl) coupon;
-                // Load full CouponSeriesEntity from main cache (needed for setCodeLevelRedemptions)
-                CouponSeriesEntity couponSeriesEntity = m_couponSeriesConfigManager.getCouponConfig(
-                        couponImpl.getOrgId(), couponImpl.getCouponEntity().getCouponSeriesId())
-                        .getCouponSeriesEntity();
+                // Load full CouponSeriesConfig from main cache (needed for setCodeLevelRedemptions)
+                // Also set it in CouponImpl to avoid NPE in downstream code that might access getCouponSeriesConfig()
+                CouponSeriesConfig couponSeriesConfig = m_couponSeriesConfigManager.getCouponConfig(
+                        couponImpl.getOrgId(), couponImpl.getCouponEntity().getCouponSeriesId());
+                couponImpl.setCouponSeriesConfig(couponSeriesConfig);
+                CouponSeriesEntity couponSeriesEntity = couponSeriesConfig.getCouponSeriesEntity();
                 if (couponSeriesEntity != null) {
                     m_couponService.setCodeLevelRedemptions(couponSeriesEntity, 
                             couponImpl.getCouponEntity(), couponImpl);
@@ -183,10 +208,12 @@ private List<Coupon> filterExpiredCoupons(int orgId, Date minExpiryDate, List<Co
 ```
 
 **Key Changes**:
-1. Uses `prepareCouponsFromEntityForExpiryFilter()` instead of `prepareCouponsFromEntity()`
-2. Sorting happens **before** `setCodeLevelRedemptions()` - processes expensive operations only on final set
-3. `setCodeLevelRedemptions()` called **only for filtered coupons** (not all coupons)
-4. Full `CouponSeriesEntity` loaded from main cache **only when needed** for `setCodeLevelRedemptions()`
+1. Uses `prepareCouponsFromEntityForExpiryFilter()` which bulk loads to warm the cache
+2. **Expiry dates calculated AFTER `updateBulkExpiryDates()`** - directly from warmed cache (O(1) lookup)
+3. Sorting happens **before** `setCodeLevelRedemptions()` - processes expensive operations only on final set
+4. `setCodeLevelRedemptions()` called **only for filtered coupons** (not all coupons)
+5. Full `CouponSeriesConfig` loaded from main cache **only when needed** for `setCodeLevelRedemptions()`
+6. **`CouponSeriesConfig` set in `CouponImpl`** to avoid NPE in downstream code
 
 ### 4. New prepareCouponsFromEntityForExpiryFilter Method
 
@@ -195,22 +222,37 @@ private List<Coupon> filterExpiredCoupons(int orgId, Date minExpiryDate, List<Co
 ```java
 private List<Coupon> prepareCouponsFromEntityForExpiryFilter(int orgId, List<CouponEntity> couponEntities) {
     List<Coupon> coupons = new ArrayList<>();
-    if (couponEntities != null && !couponEntities.isEmpty()) {
-        for (CouponEntity currentEntity : couponEntities) {
-            try {
-                // Use lightweight cache - returns CouponSeriesEntityForExpiry (implements ExpiryInfo)
-                CouponSeriesEntityForExpiry expiryInfo =
-                        m_couponSeriesEntityForExpiryCacheManager.getCouponSeriesEntityForExpiry(
-                                orgId, currentEntity.getCouponSeriesId());
-                // Create coupon with couponSeriesEntity = null to avoid storing full entity
-                CouponImpl coupon = new CouponImpl(currentEntity, (CouponSeriesEntity) null);
-                // Calculate and cache expiry date using lightweight ExpiryInfo
-                coupon.getExpiryDate(expiryInfo);
-                coupons.add(coupon);
-            } catch (Exception e) {
-                logger.debug("couponseries entity could not be loaded for expiry filtering, coupon series id {}",
-                        currentEntity.getCouponSeriesId(), e);
-            }
+
+    if (couponEntities == null || couponEntities.isEmpty()) {
+        return coupons;
+    }
+
+    // Collect unique CouponSeriesKeys for bulk loading (warms the cache)
+    Set<CouponSeriesKey> uniqueKeys = new HashSet<>();
+    for (CouponEntity currentEntity : couponEntities) {
+        CouponSeriesKey key = new CouponSeriesKey(orgId, currentEntity.getCouponSeriesId());
+        uniqueKeys.add(key);
+    }
+    List<CouponSeriesKey> keys = new ArrayList<>(uniqueKeys);
+
+    // Bulk load all CouponSeriesEntityForExpiry objects to warm the cache
+    // This ensures all entries are in cache for fast O(1) lookups later
+    try {
+        m_couponSeriesEntityForExpiryCacheManager.getCouponSeriesEntitiesForExpiry(keys);
+    } catch (Exception e) {
+        logger.error("error while bulk loading coupon series entities for expiry filtering", e);
+    }
+
+    // Create coupons with couponSeriesEntity = null (expiry date will be calculated after updateBulkExpiryDates)
+    // Cache is already warmed, so we can directly lookup from cache when needed
+    for (CouponEntity currentEntity : couponEntities) {
+        try {
+            // Create coupon with couponSeriesEntity = null to avoid storing full entity
+            CouponImpl coupon = new CouponImpl(currentEntity, (CouponSeriesEntity) null);
+            coupons.add(coupon);
+        } catch (Exception e) {
+            logger.debug("could not create coupon for expiry filtering, coupon series id {}",
+                    currentEntity.getCouponSeriesId(), e);
         }
     }
     return coupons;
@@ -218,10 +260,11 @@ private List<Coupon> prepareCouponsFromEntityForExpiryFilter(int orgId, List<Cou
 ```
 
 **Key Differences from `prepareCouponsFromEntity()`**:
+- ✅ **Bulk loading**: Collects unique `CouponSeriesKey` objects and bulk loads all `CouponSeriesEntityForExpiry` in one call
+- ✅ **Cache warming**: Bulk load ensures all entries are in cache for fast O(1) lookups later
 - ✅ Uses `CouponSeriesEntityForExpiryCacheManager` instead of `CouponSeriesConfigManager`
-- ✅ Uses lightweight `CouponSeriesEntityForExpiry` (implements `ExpiryInfo`) instead of full `CouponSeriesConfig`
 - ✅ Creates `CouponImpl` with `couponSeriesEntity = null` - avoids storing full entity
-- ✅ Calls `getExpiryDate(expiryInfo)` to calculate and cache expiry date using lightweight `ExpiryInfo`
+- ✅ **Does NOT** call `getExpiryDate(expiryInfo)` here - expiry dates calculated after `updateBulkExpiryDates()`
 - ✅ **Does NOT** call `setCodeLevelRedemptions()` here (moved to after filtering)
 
 ### 5. CouponImpl Enhancements
@@ -372,9 +415,11 @@ These maps are populated when the full `CouponSeriesEntity` is loaded from the m
     - RedemptionOrgEntities query
     - CustomPropertyKeyValues query
 
-**After**: For each coupon entity:
-- 1 query to load base `CouponSeriesEntity` (no joins)
-- Cache hit on subsequent requests for same series ID
+**After**:
+- **Bulk loading**: Collects unique coupon series IDs and loads all `CouponSeriesEntityForExpiry` objects in one batch operation
+- For each unique series ID: 1 query to load base `CouponSeriesEntity` + `OwnerInfoEntity` (no other joins)
+- **Cache hits**: Subsequent lookups for same series ID are O(1) cache hits (no database queries)
+- Individual cache lookups after bulk load are fast O(1) operations
 
 ### 2. Reduced Memory Usage
 - **Before**: Full `CouponSeriesConfig` object with all joined collections stored in `CouponImpl`
@@ -389,10 +434,12 @@ These maps are populated when the full `CouponSeriesEntity` is loaded from the m
 - **After**: `setCodeLevelRedemptions()` called ONLY for filtered coupons that pass expiry check
 
 ### 4. Better Cache Efficiency
+- **Bulk loading**: All `CouponSeriesEntityForExpiry` objects loaded in one batch operation to warm the cache
 - Lightweight cache entries (`CouponSeriesEntityForExpiry`) take significantly less memory (only 5 fields)
 - More entries can fit in the same cache size
 - Faster cache loading due to fewer database queries (only base entity + OwnerInfoEntity)
-- O(1) cache lookup performance with Guava cache
+- O(1) cache lookup performance with Guava cache after warming
+- Direct cache lookups after bulk load avoid maintaining separate maps in memory
 
 ### 5. Interface-Based Design Benefits
 - Clean separation of concerns with `ExpiryInfo` interface
@@ -428,9 +475,11 @@ These maps are populated when the full `CouponSeriesEntity` is loaded from the m
 
 2. **`CouponRuntimeServiceImpl.java`**:
     - Modified `filterExpiredCoupons()` to use lightweight cache
-    - Added `prepareCouponsFromEntityForExpiryFilter()` method
+    - Added `prepareCouponsFromEntityForExpiryFilter()` method with bulk loading
+    - Expiry dates calculated **after** `updateBulkExpiryDates()` by directly looking up from warmed cache
     - Moved `setCodeLevelRedemptions()` to after filtering and sorting
-    - Loads full `CouponSeriesEntity` from main cache only for filtered coupons when needed
+    - Loads full `CouponSeriesConfig` from main cache only for filtered coupons when needed
+    - Sets `CouponSeriesConfig` in `CouponImpl` to avoid NPE in downstream code
 
 3. **`CouponSeriesEntityService.java`**:
     - Added `getForExpiryFiltering()` method - loads base entity + OwnerInfoEntity
@@ -483,17 +532,44 @@ These maps are populated when the full `CouponSeriesEntity` is loaded from the m
 - **Lazy Loading**: Full `CouponSeriesEntity` loaded only when needed for `setCodeLevelRedemptions()` after filtering
 
 ### Performance Optimization
-- **O(1) Cache Lookup**: Guava cache provides constant-time access
+- **Bulk Loading**: All `CouponSeriesEntityForExpiry` objects loaded in one batch to warm cache
+- **O(1) Cache Lookup**: After warming, individual lookups are fast O(1) cache hits (no database queries)
 - **Reduced Database Queries**: Only base entity + OwnerInfoEntity loaded, skipping 5+ other joins
-- **Optimized Order**: Sorting happens before `setCodeLevelRedemptions()`, so expensive operations only run on filtered set
+- **Optimized Order**:
+    - Expiry dates calculated **after** `updateBulkExpiryDates()` using warmed cache
+    - Sorting happens before `setCodeLevelRedemptions()`, so expensive operations only run on filtered set
+- **No Map Storage**: Direct cache lookups avoid maintaining separate maps in memory
+
+## Implementation Flow
+
+### Current Flow:
+1. **Bulk Load Phase** (`prepareCouponsFromEntityForExpiryFilter`):
+    - Collects unique `CouponSeriesKey` objects from all coupon entities
+    - Bulk loads all `CouponSeriesEntityForExpiry` objects in one call (warms the cache)
+    - Creates `CouponImpl` objects with `couponSeriesEntity = null` (no expiry date calculation yet)
+
+2. **Bulk Expiry Update**:
+    - Calls `couponExpiryService.updateBulkExpiryDates(coupons)` on all coupons
+
+3. **Expiry Date Calculation**:
+    - Iterates through coupons and directly looks up `CouponSeriesEntityForExpiry` from warmed cache (O(1) lookup)
+    - Calls `couponImpl.getExpiryDate(expiryInfo)` to calculate and cache expiry date
+
+4. **Filtering & Sorting**:
+    - Filters coupons by expiry date
+    - Sorts filtered coupons by expiry date
+
+5. **Code-Level Redemptions** (only for filtered coupons):
+    - Loads full `CouponSeriesConfig` from main cache
+    - Sets `CouponSeriesConfig` in `CouponImpl` to avoid NPE
+    - Calls `setCodeLevelRedemptions()` only for filtered coupons
 
 ## Future Optimizations
 
-1. **Batch Loading**: Further optimize by batching coupon series entity loads in `prepareCouponsFromEntityForExpiryFilter()`
-2. **Selective Field Loading**: Consider loading only the 5 required fields directly from database if possible
-3. **Cache Warming**: Pre-warm cache for frequently accessed series
-4. **Metrics**: Add detailed metrics for cache performance monitoring
-5. **Parallel Processing**: Consider parallel processing of expiry filtering for large coupon lists
+1. **Selective Field Loading**: Consider loading only the 5 required fields directly from database if possible
+2. **Cache Warming**: Pre-warm cache for frequently accessed series
+3. **Metrics**: Add detailed metrics for cache performance monitoring
+4. **Parallel Processing**: Consider parallel processing of expiry filtering for large coupon lists
 
 ## Related Documentation
 
