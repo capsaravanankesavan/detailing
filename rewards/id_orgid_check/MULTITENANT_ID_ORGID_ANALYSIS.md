@@ -1,5 +1,31 @@
 # Multi-Tenant Analysis: ID vs (ID, ORG_ID) Lookups
 
+## Table of Contents
+
+- [Purpose](#purpose)
+- [1. Database Schema: Composite PK (ID, ORG_ID)](#1-database-schema-composite-pk-id-org_id)
+- [2. Java JPA Layer: Single @Id vs Composite](#2-java-jpa-layer-single-id-vs-composite)
+    - [2.1 Entity PK Mapping](#21-entity-pk-mapping)
+    - [2.2 Inherited JpaRepository Methods (Risk)](#22-inherited-jparepository-methods-risk)
+    - [2.3 @JoinColumn: Lazy Load and Joins Use Only FK Column](#23-joincolumn-lazy-load-and-joins-use-only-fk-column)
+- [3. ID-Only Lookups and Cross-Org Risk](#3-id-only-lookups-and-cross-org-risk)
+    - [3.1 Confirmed ID-Only Usage (Must Fix)](#31-confirmed-id-only-usage-must-fix)
+    - [3.2 Correct Pattern (orgId + id)](#32-correct-pattern-orgid--id)
+    - [3.3 JPA Repositories Extending JpaRepository](#33-jpa-repositories-extending-jparepositoryentity-long)
+- [4. JDBC / Native Queries](#4-jdbc--native-queries)
+- [5. Duplicate Data Copy (UAT → Prod Org): Checklist](#5-duplicate-data-copy-uat--prod-org-checklist)
+- [6. Action Items: Prevent Cross-Org Lookup and Lookup/Stream/Map Errors](#6-action-items-prevent-cross-org-lookup-and-lookupstreammap-errors)
+    - [6.1 Code Fixes (Must Do Before Org Copy)](#61-code-fixes-must-do-before-org-copy)
+    - [6.2 Lookup Patterns (Prevent Wrong Row / Exceptions)](#62-lookup-patterns-prevent-wrong-row--exceptions)
+    - [6.3 Stream / Map: Avoid Lazy Load and ID-Only Resolution](#63-stream--map-avoid-lazy-load-and-id-only-resolution)
+    - [6.4 Exceptions / Errors to Prevent](#64-exceptions--errors-to-prevent)
+    - [6.5 New Code and Review Checklist](#65-new-code-and-review-checklist)
+    - [6.6 Optional: Static / Automation](#66-optional-static--automation)
+    - [6.7 JPA Repositories: Do the Action Items Apply?](#67-jpa-repositories-do-the-action-items-apply)
+- [7. Summary](#7-summary)
+
+---
+
 ## Purpose
 
 To support **duplicating UAT org data into a new prod org** (copy all rows and update `ORG_ID`), we must ensure:
