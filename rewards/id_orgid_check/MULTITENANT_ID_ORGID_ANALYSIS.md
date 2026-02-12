@@ -174,9 +174,9 @@ If a child row is loaded in context of org A and then `reward` is accessed, Hibe
 
 | Location | Code | Risk | Status |
 |----------|------|------|--------|
-| `BrandFacade.java` | `brandRepository.findById(request.getId())` | Loads Brand by ID only. After org copy, same brand ID can exist in multiple orgs; can return wrong org or wrong row. | **Fixed:** Replaced with `brandRepository.findByIdAndOrgId(request.getId(), authDetailsProvider.get().getOrgId())`. |
+| `BrandFacade.java` | `brandRepository.findById(request.getId())` | Loads Brand by ID only. After org copy, same brand ID can exist in multiple orgs; can return wrong org or wrong row. | **Action:** Replace with `brandRepository.findByIdAndOrgId(request.getId(), authDetailsProvider.get().getOrgId())` before org copy. Implementation planned later. |
 
-**No other ID-only lookups found** in the codebase (search: `findById(`, `getById(`, `getOne(`, `EntityManager.find`). Pre-copy action: this was the only change required.
+**No other ID-only lookups found** in the codebase (search: `findById(`, `getById(`, `getOne(`, `EntityManager.find`). Pre-copy action: this is the only code change required; to be implemented before org copy.
 
 ### 3.2 Correct Pattern (orgId + id)
 
@@ -250,7 +250,7 @@ Use this section as a checklist. Completing these items ensures no cross-org dat
 
 | # | Action | Location / Scope | Why |
 |---|--------|------------------|-----|
-| 1 | **Replace ID-only Brand lookup** | `BrandFacade.java` (~line 94) | ~~`brandRepository.findById(request.getId())`~~ → **Done:** now uses `findByIdAndOrgId(request.getId(), authDetailsProvider.get().getOrgId())`. |
+| 1 | **Replace ID-only Brand lookup** | `BrandFacade.java` (~line 94) | `brandRepository.findById(request.getId())` → replace with `findByIdAndOrgId(request.getId(), authDetailsProvider.get().getOrgId())` before org copy. (Impl later.) |
 | 1a | Use org-scoped lookup and pass `orgId` from context. | Same | Ensures the brand is always for the current org; avoids cross-org and NPE when brand doesn't exist in that org. |
 | 2 | **Audit all repositories** for `findById(`, `getById(`, `getOne(` on tenant entities. | All repositories extending `JpaRepository<Entity, Long>` for entities in Section 1 | Any ID-only call can return wrong org or throw after copy. Replace with `findByOrgIdAndId(orgId, id)` (or equivalent). |
 | 3 | **Ensure `orgId` is always available** where tenant lookups happen. | Request handlers, facades, services that perform lookups | If `orgId` is missing, developers may fall back to `findById(id)`; enforce passing `orgId` from auth/context. |
@@ -345,7 +345,7 @@ So for **RewardDetailsExtendedPropertyValueRepository**, **DownstreamFailureLogR
 | DB schema | Tenant tables use composite PK `(ID, ORG_ID)`; copy by updating ORG_ID is consistent with schema. | Ensure no unique constraint on `ID` alone. |
 | JPA entities | Use single `@Id` (ID); `orgId` in WHERE only. | Keep adding `orgId` to all custom queries; avoid composite @Id unless we refactor. |
 | Repositories | Inherited `findById(Long)` exists for all JpaRepository<*, Long>. | Do not use for tenant entities; use only org-scoped finders. |
-| BrandFacade | ~~Used `brandRepository.findById(request.getId())`.~~ | **Fixed:** uses `findByIdAndOrgId(id, authDetailsProvider.get().getOrgId())`. |
+| BrandFacade | Uses `brandRepository.findById(request.getId())`. | Replace with `findByIdAndOrgId(id, orgId)` (org from context) before org copy. (Impl later.) |
 | @JoinColumn | Many associations use single column (e.g. REWARD_ID). | Avoid relying on lazy load of parent; load via org-scoped queries. |
 | JDBC/native | Sampled queries use `org_id` and (id, org_id) joins. | Keep pattern; audit any new SQL. |
 
