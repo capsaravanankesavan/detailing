@@ -25,6 +25,12 @@ protective-isolation RabbitMQ container factory.
 | FR-007 | `ExpiryDateChangeHelper.updateExpiryDateChangeJobs()` sums `countByStatus(RUNNING)` across ALL shards after the shard loop and calls `ExpiryDateChangeJobFacade.reconcileSemaphoreCounter(totalRunning)` | §8f, UC-4, Gap 2 |
 | FR-008 | `expiryDateChangeContainerFactory` bean calls `configurer.configure(factory, connectionFactory)` first (inherits retry interceptor), then hard-pins `prefetchCount=1`, `concurrentConsumers=1`, `maxConcurrentConsumers=1` | §8c, Gap 3 |
 | FR-009 | `ExpiryDateChangeJobDao.countByStatus(BatchStatus)` derived query is index-covered via `{status:1}` index | §8g |
+| FR-010 | On semaphore rejection, `changeExpiryForPromotion()` transitions the job to `BatchStatus.WAITING` (via `updateExpiryDateChangeJobStatus()`) BEFORE throwing `SemaphoreRejectedException` — updates `lastUpdatedOn` to NOW on every rejection, resetting the 24h expiry clock | §8e, UC-5, Handoff |
+| FR-011 | `shouldProceed()` returns `true` for `BatchStatus.WAITING` so the next retry attempt is allowed to proceed; returns `false` for `COMPLETED`, `EXPIRED`, `STOPPED`, `RUNNING` | §8e, §8i |
+| FR-012 | `isJobRunningForPromotion()` includes `BatchStatus.WAITING` in the status guard — a second `updatePromotion()` API call while the first job is retrying (WAITING) must be blocked with `UPDATE_EXPIRY_DATE_NOT_ALLOWED` | §8l, UC-11 |
+| FR-013 | `markAllJobAsExpiredIfNotRunning()` expires WAITING jobs whose `lastUpdatedOn` is more than **2 hours** ago (orphan cleanup: pod died mid-retry); does NOT expire WAITING jobs whose `lastUpdatedOn` is within 2h | §8l, UC-10 |
+| FR-014 | `SemaphoreRejectedException` is thrown (not generic `RuntimeException`) on semaphore limit hit; `RMQMessageTrackerAspect` does NOT call `markAsFailedRequest()` when the caught exception (or its cause) is `SemaphoreRejectedException` | §8j, §8k |
+| FR-015 | `expiryDateChangeContainerFactory`'s `MessageRecoverer` fires **exactly once** when all retry attempts are exhausted; it logs an `ERROR` containing the retry count and cause, and calls `metricsService.markAsFailedRequest(EXPIRY_JOB_RETRY_EXHAUSTED_EVENT)` | §8c (Fix-B), UC-12 |
 
 ### Non-Functional Requirements
 
@@ -61,6 +67,11 @@ protective-isolation RabbitMQ container factory.
 | Tenant isolation | `$in` IDs contain cross-org documents due to wrong `orgId` filter in aggregation | P0 |
 | Load — semaphore throttle | Under large batch, >3 jobs run concurrently; MongoDB CPU spike not reduced | P1 (NFR-006) |
 | Load — message loss | Jobs exhausting retry window dead-letter when `maxGlobalConcurrentJobs` is too low | P1 (NFR-007) |
+| Redis restart — no persistence | Redis Sentinel restart with AOF/RDB disabled resets counter to 0; counter goes negative as in-flight jobs release; up to 6 pods run concurrently until hourly reconciliation | P1 (Risk-7) |
+| WAITING — duplicate job | `isJobRunningForPromotion()` missing WAITING → second API call creates duplicate job while first is retrying → double document update | P0 (FR-012) |
+| WAITING — premature expiry | `shouldProceed()` not updated for WAITING → job silently dropped on next retry attempt (shouldProceed returns false, method returns early, message consumed but job never runs) | P0 (FR-011) |
+| Fix-A — wrong exception type | Generic `RuntimeException` thrown instead of `SemaphoreRejectedException` → NR metric noise not eliminated; aspect cannot distinguish throttle from real failure | P1 (FR-014) |
+| Fix-B — retry chain override | `setAdviceChain()` called without injecting matching retry props → custom interceptor uses wrong backoff; messages exhaust retries prematurely | P0 (FR-015) |
 
 ---
 
@@ -107,6 +118,10 @@ All new unit tests for facade go in **`ExpiryDateChangeJobFacadeTest.java`**. Ta
 | UT-14 | FR-007 | `reconcileSemaphoreCounter(n)` calls `redisTemplate.opsForValue().set(SEMAPHORE_KEY, "n")`. Verify `"promotion_engine:expiry_job:running_count"` is the key used. | `ExpiryDateChangeJobFacade` | Stub `set()`; capture args | P0 |
 | UT-15 | FR-007 | `reconcileSemaphoreCounter(-1)` clamps to 0 and sets `"0"` (not `"-1"`). | `ExpiryDateChangeJobFacade` | Stub `set()`; assert set called with `"0"` | P1 |
 | UT-16 | FR-007 | `reconcileSemaphoreCounter()` does NOT throw when `redisTemplate.opsForValue().set()` throws. | `ExpiryDateChangeJobFacade` | Stub `set()` throws; assert no exception | P0 |
+| UT-16b | Risk-7 | **Counter recovery after Redis restart (negative counter):** `tryAcquireSemaphore()` when Redis returns a negative value from increment (e.g., -2, simulating post-restart DECR drift) — negative value is ≤ max, so it returns `true` (fail-open, correct). Verifies the semaphore does not permanently block acquisitions when counter is negative. | `ExpiryDateChangeJobFacade` | Stub `increment()` → `-2L`; assert `tryAcquireSemaphore()` returns `true` (not `false`) | P1 |
+| UT-EC4 | Risk-8, EC-4 | **Clamp guard — `maxGlobalConcurrentJobs=0` uses effectiveMax=1:** When `maxGlobalConcurrentJobs=0`, `tryAcquireSemaphore()` must clamp to 1 via `Math.max(1, ...)` and return `true` (job proceeds, not deadlocked). Counter increments to 1 which is ≤ effectiveMax=1. | `ExpiryDateChangeJobFacade` | `ReflectionTestUtils.setField(facade, "maxGlobalConcurrentJobs", 0)`; stub `increment()` → `1L`; call `tryAcquireSemaphore()`; assert returns `true`. Assert `decrement()` NOT called. | **P0** |
+| UT-EC4b | Risk-8 | **Clamp guard — `maxGlobalConcurrentJobs=0` logs WARN:** When effective clamp activates, a WARN log is emitted containing the misconfigured value so ops can detect and correct it. | `ExpiryDateChangeJobFacade` | Set `maxGlobalConcurrentJobs=0`; call `tryAcquireSemaphore()`; capture log output (Slf4j test appender or Mockito `verify` on logger mock); assert WARN message contains `"invalid"` or `"clamped"`. | P1 |
+| UT-EC4c | Risk-8 | **Clamp guard — valid config (1 and 3) does NOT clamp:** When `maxGlobalConcurrentJobs=1`, `effectiveMax=1` (no clamp). When `maxGlobalConcurrentJobs=3`, `effectiveMax=3`. No WARN logged. | `ExpiryDateChangeJobFacade` | Set field to 1; stub `increment()` → 1L; assert returns `true` and WARN not logged. Repeat with field=3, `increment()` → 2L. | P1 |
 
 ---
 
@@ -125,6 +140,27 @@ All new unit tests for facade go in **`ExpiryDateChangeJobFacadeTest.java`**. Ta
 |----|-----|-------------|-----------------|---------------|----------|
 | UT-19 | FR-008 | `expiryDateChangeContainerFactory()` calls `configurer.configure(factory, connectionFactory)` as the FIRST operation before any `set*` call. | `SpringAmqpConfig` | Mock `ConnectionFactory` + `RabbitListenerContainerFactoryConfigurer`; verify `configure()` called before `setConcurrentConsumers()` via `InOrder` | P0 |
 | UT-20 | FR-008, NFR-005 | Factory returned by `expiryDateChangeContainerFactory()` has `prefetchCount=1`, `concurrentConsumers=1`, `maxConcurrentConsumers=1`. | `SpringAmqpConfig` | Call method with mocks; assert via `ReflectionTestUtils.getField` or accessor if accessible | P1 |
+
+---
+
+---
+
+#### Group F — WAITING Status, Fix-A, Fix-B
+
+| ID | Req | Description | Class Under Test | Mock Strategy | Priority |
+|----|-----|-------------|-----------------|---------------|----------|
+| UT-W1 | FR-010 | `changeExpiryForPromotion()` calls `updateExpiryDateChangeJobStatus(job, WAITING)` before throwing when `tryAcquireSemaphore()` returns `false`. Verify WAITING transition happens even when throw follows immediately. | `ExpiryDateChangeJobFacade` | Spy facade; stub `tryAcquireSemaphore` → false; verify `updateExpiryDateChangeJobStatus` called with `WAITING` before exception propagates | **P0** |
+| UT-W2 | FR-014 | `changeExpiryForPromotion()` throws `SemaphoreRejectedException` (NOT generic `RuntimeException`) when semaphore limit is hit. | `ExpiryDateChangeJobFacade` | `assertThrows(SemaphoreRejectedException.class, ...)` — confirm exact type, not supertype | **P0** |
+| UT-W3 | FR-011 | `shouldProceed()` returns `true` for `WAITING` status. Also verify `shouldProceed()` returns `false` for `COMPLETED`, `EXPIRED`, `STOPPED` (regression: new WAITING must not accidentally open a hole for terminal statuses). | `ExpiryDateChangeJobFacade` | Build `ExpiryDateChangeJob` with each status; call `shouldProceed()` via reflection (private method) or via `changeExpiryForPromotion()` with early stub | **P0** |
+| UT-W4 | FR-012 | `isJobRunningForPromotion()` returns `true` when a WAITING job exists for the same `orgId + promotionId + jobType`. | `ExpiryDateChangeJobService` | Mock `expiryDateChangeJobDao.findByOrgIdAndPromotionIdAndStatusInAndJobType()` → non-null result; assert status list includes `WAITING` | **P0** |
+| UT-W5 | FR-013 | `markAllJobAsExpiredIfNotRunning()` expires a WAITING job whose `lastUpdatedOn` is > 2h ago; sets status to `EXPIRED`. | `ExpiryDateChangeJobService` | Mock `expiryDateChangeJobDao.findByStatusIn(WAITING)` → 1 job with `lastUpdatedOn = 3h ago`; verify `dao.save()` called with `status == EXPIRED` | **P0** |
+| UT-W6 | FR-013 | `markAllJobAsExpiredIfNotRunning()` does NOT expire a WAITING job whose `lastUpdatedOn` is < 2h ago (e.g., 30 min ago — active retry). | `ExpiryDateChangeJobService` | Mock `findByStatusIn(WAITING)` → 1 job with `lastUpdatedOn = 30min ago`; verify `dao.save()` NOT called | **P0** |
+| UT-W7 | FR-013 | `markAllJobAsExpiredIfNotRunning()` preserves existing OPEN/RUNNING 24h threshold — adding WAITING query must not change OPEN/RUNNING expiry behaviour. | `ExpiryDateChangeJobService` | Mock `findByStatusIn(OPEN, RUNNING)` → 1 OPEN job with `lastUpdatedOn = 23h ago`; verify NOT expired. Separate: job with `lastUpdatedOn = 25h ago` → expired. | P1 |
+| UT-W8 | FR-014 | `RMQMessageTrackerAspect` does NOT call `markAsFailedRequest()` when the exception is `SemaphoreRejectedException` directly. | `RMQMessageTrackerAspect` | Stub `MetricsService`; trigger aspect with `SemaphoreRejectedException`; verify `markAsFailedRequest()` never called | **P0** |
+| UT-W9 | FR-014 | `RMQMessageTrackerAspect` does NOT call `markAsFailedRequest()` when the exception is a `ListenerExecutionFailedException` wrapping `SemaphoreRejectedException` (Spring AMQP wraps listener exceptions). | `RMQMessageTrackerAspect` | Trigger aspect with `new ListenerExecutionFailedException("...", new SemaphoreRejectedException("..."), null)`; verify `markAsFailedRequest()` never called | **P0** |
+| UT-W10 | FR-014 | `RMQMessageTrackerAspect` DOES call `markAsFailedRequest()` for real exceptions (e.g., `RuntimeException("processing error")`). Regression: Fix-A filter must not suppress real failures. | `RMQMessageTrackerAspect` | Trigger aspect with generic `RuntimeException`; verify `markAsFailedRequest()` called exactly once | **P0** |
+| UT-W11 | FR-015 | `expiryDateChangeContainerFactory` MessageRecoverer calls `metricsService.markAsFailedRequest(EXPIRY_JOB_RETRY_EXHAUSTED_EVENT)` when invoked with a non-null cause. | `SpringAmqpConfig` | Capture `MessageRecoverer` from built `StatefulRetryOperationsInterceptor`; invoke `recover(message, cause)` directly; verify `metricsService.markAsFailedRequest()` called | **P0** |
+| UT-W12 | FR-015 | `expiryDateChangeContainerFactory` MessageRecoverer logs an ERROR containing the retry count and cause message. | `SpringAmqpConfig` | Same setup as UT-W11; attach test log appender; assert ERROR log contains retry count and cause | P1 |
 
 ---
 
@@ -374,6 +410,10 @@ ReflectionTestUtils.setField(facade, "maxGlobalConcurrentJobs", 3);
 | UT-14 | `reconcileSemaphoreCounter_positive_setsRedisKey` | 1. Stub `valueOperations.set(any(), any())`. 2. Call `facade.reconcileSemaphoreCounter(2L)`. | `valueOperations.set("promotion_engine:expiry_job:running_count", "2")` called once. |
 | UT-15 | `reconcileSemaphoreCounter_negative_clampsToZero` | 1. Stub `valueOperations.set()`. 2. Call `facade.reconcileSemaphoreCounter(-1L)`. | `set("promotion_engine:expiry_job:running_count", "0")` called — NOT `"-1"`. |
 | UT-16 | `reconcileSemaphoreCounter_redisDown_noExceptionPropagates` | 1. Stub `valueOperations.set()` throws `RedisConnectionFailureException`. 2. Call `facade.reconcileSemaphoreCounter(1L)`. | No exception thrown. |
+| UT-16b | `tryAcquireSemaphore_negativeCounter_failOpenReturnsTrue` | 1. Stub `valueOperations.increment(SEMAPHORE_KEY)` → `-2L` (simulates post-Redis-restart counter drift where in-flight jobs have DECR'd past zero). 2. Call `facade.tryAcquireSemaphore("job-1", 100L)`. | Returns `true` (negative value is ≤ max=3, so acquisition allowed — fail-safe). `decrement()` NOT called. |
+| UT-EC4 | `tryAcquireSemaphore_maxJobsZero_clampsToOneAndReturnsTrue` | 1. `ReflectionTestUtils.setField(facade, "maxGlobalConcurrentJobs", 0)`. 2. Stub `valueOperations.increment(SEMAPHORE_KEY)` → `1L`. 3. Call `facade.tryAcquireSemaphore("job-1", 100L)`. | Returns `true` (clamped effectiveMax=1; counter 1 ≤ 1 → allowed). `decrement()` NOT called. No exception. |
+| UT-EC4b | `tryAcquireSemaphore_maxJobsZero_logsWarn` | 1. Set `maxGlobalConcurrentJobs=0`. 2. Stub increment → `1L`. 3. Attach test log appender or mock logger. 4. Call `tryAcquireSemaphore()`. | WARN log emitted containing `"invalid"` and the value `"0"`. No WARN emitted when field=3. |
+| UT-EC4c | `tryAcquireSemaphore_validConfig_noClamp` | 1. Set field=1; stub `increment()` → `1L`; call and assert `true`, no WARN. 2. Set field=3; stub `increment()` → `2L`; call and assert `true`, no WARN. | Returns `true` in both cases. No WARN log. No unintended clamping. |
 
 ---
 
@@ -401,6 +441,59 @@ ReflectionTestUtils.setField(facade, "maxGlobalConcurrentJobs", 3);
 |----|-------------|-------------|-----------|
 | UT-19 | `expiryDateChangeContainerFactory_configurerCalledFirst` | 1. Call `config.expiryDateChangeContainerFactory(connectionFactory, configurer)`. 2. Capture `SimpleRabbitListenerContainerFactory` arg passed to `configurer.configure()`. 3. Use `InOrder inOrder = inOrder(configurer)`. | `inOrder.verify(configurer).configure(any(SimpleRabbitListenerContainerFactory.class), eq(connectionFactory))` is the first call. `configure()` called before any `setConcurrentConsumers` call. |
 | UT-20 | `expiryDateChangeContainerFactory_hardPinsValues` | 1. Call `config.expiryDateChangeContainerFactory(connectionFactory, configurer)`. 2. Capture returned `SimpleRabbitListenerContainerFactory`. | `ReflectionTestUtils.getField(factory, "concurrentConsumers") == 1`. `ReflectionTestUtils.getField(factory, "maxConcurrentConsumers") == 1`. `ReflectionTestUtils.getField(factory, "prefetchCount") == 1`. |
+
+---
+
+---
+
+#### Group F — WAITING Status, Fix-A, Fix-B
+
+##### Sub-group F1: WAITING transitions (`ExpiryDateChangeJobFacadeTest`)
+
+**File:** `src/test/java/com/capillary/promotionengine/service/impl/ExpiryDateChange/ExpiryDateChangeJobFacadeTest.java`
+*(Extend existing class — add to existing `@Mock` + `@Before` setup.)*
+
+| ID | Method Name | Setup Steps | Assertion |
+|----|-------------|-------------|-----------|
+| UT-W1 | `changeExpiryForPromotion_semaphoreRejected_transitionsToWaiting` | 1. Build OPEN job, stub `expiryDateChangeJobService.findById()` → job. 2. `doReturn(false).when(spy).tryAcquireSemaphore(any(), any())`. 3. Stub `expiryDateChangeJobService.updateExpiryDateChangeJobStatus(any(), eq(BatchStatus.WAITING))` → updated job. 4. Wrap call in `assertThrows`. | `updateExpiryDateChangeJobStatus` called with `BatchStatus.WAITING` (via `verify(expiryDateChangeJobService).updateExpiryDateChangeJobStatus(job, BatchStatus.WAITING)`). |
+| UT-W2 | `changeExpiryForPromotion_semaphoreRejected_throwsSemaphoreRejectedException` | Same as UT-W1 setup. | `assertThrows(SemaphoreRejectedException.class, () -> spy.changeExpiryForPromotion(jobId))`. Assert NOT `instanceof RuntimeException` only — it MUST be the specific subtype. |
+| UT-W3 | `shouldProceed_waitingStatus_returnsTrue` | Build job with `status = BatchStatus.WAITING`. Call `shouldProceed` via reflection: `Method m = ExpiryDateChangeJobFacade.class.getDeclaredMethod("shouldProceed", ExpiryDateChangeJob.class); m.setAccessible(true);`. | Returns `true`. Also: COMPLETED → `false`, EXPIRED → `false`, STOPPED → `false`. |
+
+##### Sub-group F2: `ExpiryDateChangeJobService` WAITING logic
+
+**File:** `src/test/java/com/capillary/promotionengine/service/impl/ExpiryDateChange/ExpiryDateChangeJobServiceTest.java`
+**Annotations:** `@RunWith(MockitoJUnitRunner.class)`
+**Fields:** `@InjectMocks ExpiryDateChangeJobService service;` `@Mock ExpiryDateChangeJobDao expiryDateChangeJobDao;`
+
+| ID | Method Name | Setup Steps | Assertion |
+|----|-------------|-------------|-----------|
+| UT-W4 | `isJobRunningForPromotion_waitingJob_returnsTrue` | 1. Build a WAITING `ExpiryDateChangeJob`. 2. Stub `dao.findByOrgIdAndPromotionIdAndStatusInAndJobType(eq(100L), eq("promo-1"), argThat(list -> list.contains(BatchStatus.WAITING)), any())` → the WAITING job. 3. Call `service.isJobRunningForPromotion(100L, "promo-1", ISSUED)`. | Returns `true`. Verify that the status list passed to dao includes `BatchStatus.WAITING`. |
+| UT-W5 | `markAllJobAsExpiredIfNotRunning_waitingJobOlderThan2h_expires` | 1. Build WAITING job with `lastUpdatedOn = now - 3h`. 2. Stub `dao.findByStatusIn(OPEN, RUNNING)` → empty list. 3. Stub `dao.findByStatusIn(WAITING)` → list with the 3h-old job. | `dao.save()` called once; saved job has `status == BatchStatus.EXPIRED`. |
+| UT-W6 | `markAllJobAsExpiredIfNotRunning_waitingJobWithin2h_notExpired` | 1. Build WAITING job with `lastUpdatedOn = now - 30min`. 2. Stub `dao.findByStatusIn(WAITING)` → list with that job. | `dao.save()` NOT called for the WAITING job. |
+| UT-W7 | `markAllJobAsExpiredIfNotRunning_openJobUnder24h_notExpired` | 1. Build OPEN job with `lastUpdatedOn = now - 23h`. 2. Stub `dao.findByStatusIn(OPEN, RUNNING)` → list with that job. | `dao.save()` NOT called (existing 24h threshold regression). |
+
+##### Sub-group F3: `RMQMessageTrackerAspect` Fix-A filtering
+
+**File:** `src/test/java/.../aspect/RMQMessageTrackerAspectTest.java`
+**Annotations:** `@RunWith(MockitoJUnitRunner.class)`
+**Fields:** `@InjectMocks RMQMessageTrackerAspect aspect;` `@Mock MetricsService metricsService;` `@Mock ProceedingJoinPoint joinPoint;`
+
+| ID | Method Name | Setup Steps | Assertion |
+|----|-------------|-------------|-----------|
+| UT-W8 | `aspect_semaphoreRejectedException_notCountedAsFailure` | 1. Stub `joinPoint.proceed()` throws `new SemaphoreRejectedException("throttle")`. 2. Invoke the aspect's around/after-throwing method. | `metricsService.markAsFailedRequest(any())` NEVER called. |
+| UT-W9 | `aspect_wrappedSemaphoreRejectedException_notCountedAsFailure` | 1. Stub `joinPoint.proceed()` throws `new ListenerExecutionFailedException("wrapped", new SemaphoreRejectedException("throttle"), null)`. 2. Invoke aspect. | `metricsService.markAsFailedRequest(any())` NEVER called. |
+| UT-W10 | `aspect_realException_countedAsFailure` | 1. Stub `joinPoint.proceed()` throws `new RuntimeException("real error")`. 2. Invoke aspect. | `metricsService.markAsFailedRequest(any())` called exactly once. |
+
+##### Sub-group F4: `SpringAmqpConfig` Fix-B MessageRecoverer
+
+**File:** `src/test/java/com/capillary/promotionengine/queue/SpringAmqpConfigTest.java`
+*(Extend existing class — add to existing `@Mock` setup for `ConnectionFactory` + `RabbitListenerContainerFactoryConfigurer`.)*
+**Additional field:** `@Mock MetricsService metricsService;`
+
+| ID | Method Name | Setup Steps | Assertion |
+|----|-------------|-------------|-----------|
+| UT-W11 | `expiryDateChangeContainerFactory_messageRecoverer_callsMetricsOnExhaustion` | 1. `ReflectionTestUtils.setField(config, "retryMaxAttempts", 10)` (and other retry props). 2. Call `config.expiryDateChangeContainerFactory(connectionFactory, configurer)`. 3. Extract `StatefulRetryOperationsInterceptor` from the returned factory's advice chain via `ReflectionTestUtils`. 4. Extract `MessageRecoverer` from the interceptor. 5. Build a dummy `Message` and `RuntimeException`. 6. Call `recoverer.recover(message, cause)`. | `metricsService.markAsFailedRequest(NewrelicConstants.EXPIRY_JOB_RETRY_EXHAUSTED_EVENT)` called exactly once. |
+| UT-W12 | `expiryDateChangeContainerFactory_messageRecoverer_logsError` | Same setup as UT-W11; attach test log appender. Call `recoverer.recover(message, cause)`. | Log output contains `ERROR` level entry with retry count (e.g., `"10"`) and cause message. |
 
 ---
 
@@ -451,15 +544,18 @@ ReflectionTestUtils.setField(facade, "maxGlobalConcurrentJobs", 3);
 
 | Layer | Count | ~% of Total |
 |-------|-------|-------------|
-| Unit | 20 | ~61% |
-| Integration | 5 | ~15% |
-| Automation — E2E (`test_ExpiryJob_EndToEnd.py`) | 2 | ~6% |
-| Automation — Load (`test_ExpiryJob_Load.py`) | 3 | ~9% |
+| Unit — Groups A–E (original) | 23 | — |
+| Unit — Group F (WAITING, Fix-A, Fix-B) | 12 | — |
+| **Unit total** | **35** | **~62%** |
+| Integration | 5 | ~9% |
+| Automation — E2E (`test_ExpiryJob_EndToEnd.py`) | 2 | ~4% |
+| Automation — Load (`test_ExpiryJob_Load.py`) | 3 | ~5% |
 | Automation (prod) | 0 | 0% |
-| Manual (Load Test Protocol — Nightly) | 3 steps | ~9% |
-| **Total** | **33** | **100%** |
+| Manual (Load Test Protocol — Nightly) | 3 steps | ~5% |
+| **Total** | **48** | **100%** |
 
-Requirements coverage: **9/9 FRs** (100%), **7/7 NFRs** (100%)
+Requirements coverage: **15/15 FRs** (100%), **7/7 NFRs** (100%)
+Edge case coverage: **EC-1A, EC-1B, EC-2A, EC-2B, EC-3, EC-4** (all 6 semaphore edge cases) + **WAITING state machine** (UC-10, UC-11, UC-12)
 
 ---
 
@@ -490,8 +586,11 @@ Requirements coverage: **9/9 FRs** (100%), **7/7 NFRs** (100%)
 
 These P0 tests are the minimum gate before merging. All must pass.
 
-**Unit (P0):**
-UT-01, UT-02, UT-04, UT-05, UT-06, UT-07, UT-08, UT-09, UT-12, UT-13, UT-14, UT-16, UT-17, UT-19
+**Unit (P0) — original groups:**
+UT-01, UT-02, UT-04, UT-05, UT-06, UT-07, UT-08, UT-09, UT-12, UT-13, UT-14, UT-16, UT-17, UT-19, UT-EC4, UT-EC4b
+
+**Unit (P0) — Group F (WAITING, Fix-A, Fix-B):**
+UT-W1, UT-W2, UT-W3, UT-W4, UT-W5, UT-W6, UT-W8, UT-W9, UT-W10, UT-W11
 
 **Integration (P0):**
 IT-01, IT-02, IT-03, IT-04
@@ -502,7 +601,7 @@ AT-DEV-01
 **Automation Load — run on Nightly post-deploy (P1, required before prod rollout):**
 AT-DEV-03 (timing baseline), AT-DEV-04 (drain), AT-DEV-05 (no message loss)
 
-**Full coverage set:** all P0 + P1 (UT-03, UT-10, UT-11, UT-15, UT-18, UT-20, IT-05, AT-DEV-02) + Load Test Protocol (Steps 1–4).
+**Full coverage set:** all P0 + P1 (UT-03, UT-10, UT-11, UT-15, UT-18, UT-20, UT-W7, UT-W12, IT-05, AT-DEV-02) + Load Test Protocol (Steps 1–4).
 
 ---
 
@@ -532,3 +631,11 @@ AT-DEV-03 (timing baseline), AT-DEV-04 (drain), AT-DEV-05 (no message loss)
 - [ ] New Relic `opcounters.update` screenshot attached to PR showing flattened spike (Step 4)
 - [ ] No existing tests broken (RG-01 through RG-06)
 - [ ] Redis key `promotion_engine:expiry_job:running_count` stays ≤ 3 during a real batch run (manual post-deploy check)
+- [ ] `tryAcquireSemaphore()` clamps `maxGlobalConcurrentJobs < 1` to 1 and logs WARN (UT-EC4) — pod stays functional instead of deadlocking; ops alerted via log
+- [ ] `shouldProceed()` allows WAITING and only WAITING (not COMPLETED/EXPIRED/STOPPED) — UT-W3
+- [ ] On semaphore rejection: job transitions to WAITING (lastUpdatedOn refreshed) AND `SemaphoreRejectedException` thrown — UT-W1, UT-W2
+- [ ] `isJobRunningForPromotion()` returns true for WAITING jobs — duplicate job creation blocked — UT-W4
+- [ ] WAITING jobs older than 2h are expired; active-retry WAITING jobs (< 2h) are NOT expired — UT-W5, UT-W6
+- [ ] `RMQMessageTrackerAspect` skips NR failure metric for `SemaphoreRejectedException` (direct and wrapped) — UT-W8, UT-W9
+- [ ] `RMQMessageTrackerAspect` still counts real failures after Fix-A filter — UT-W10 (regression)
+- [ ] `MessageRecoverer` fires once on retry exhaustion: ERROR logged, NR `EXPIRY_JOB_RETRY_EXHAUSTED_EVENT` emitted — UT-W11

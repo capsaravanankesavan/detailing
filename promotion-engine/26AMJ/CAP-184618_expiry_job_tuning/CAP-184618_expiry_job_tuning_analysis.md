@@ -409,6 +409,7 @@ for any reasonably-sized job. No messages are dead-lettered under normal conditi
 
 #### Counter Leak Mitigation (Pod Crash)
 
+
 If a pod is killed between `INCR` and the `finally` block, the counter stays inflated.
 
 **Reconciliation placement — CRITICAL (multi-shard correctness):**
@@ -439,6 +440,79 @@ expiryDateChangeJobFacade.reconcileSemaphoreCounter(totalRunning);
 ```java
 long countByStatus(BatchStatus status);
 ```
+
+---
+
+#### Semaphore Counter Edge Cases
+
+> **For tech-detailer and test-plan-architect:** All known ways the counter can drift, which
+> self-heal, and which require explicit code. EC-4 is the only case that requires a code fix.
+
+| EC | Trigger | Counter direction | Jobs blocked? | Self-recovery | Action required |
+|----|---------|------------------|--------------|--------------|-----------------|
+| EC-1A | Redis restart without AOF/RDB persistence — key lost | Goes negative (DECRs land on fresh 0) | **No** — negative value ≤ max, fail-open | Yes — hourly reconciliation | Confirm AOF with infra; see §Open Questions |
+| EC-1B | Fail-open acquire (Redis down, INCR never sent) + successful release (Redis back up, DECR sent) | Drifts −1 per occurrence | **No** — fail-open | Yes — hourly reconciliation | Accept; bounded drift |
+| EC-2A | Pod crash between INCR and `finally` block | Over-counts by 1 per crash | Partially — effective max = max − leaked slots | Yes — hourly reconciliation | Existing design; no change |
+| EC-2B | `releaseSemaphore` DECR throws permanently | Over-counts by 1 | Partially | Yes — hourly reconciliation | Existing catch in `releaseSemaphore`; no change |
+| EC-3 | Rejection race: Pod A INCRs to 4 (>max), Pod B INCRs to 5, both DECR back to 3 | Transient spike to 4–5 | **No** — both pods correctly rejected | Yes — same call | By design; no action needed |
+| **EC-4** | `maxGlobalConcurrentJobs = 0` (misconfiguration or typo in env var) | Stuck at 0 | **YES — hard deadlock on all pods** | **NO — reconciliation writes 0, deadlock persists** | **@PostConstruct validation required (see below)** |
+| EC-5 | `@EnableScheduling` off on all pods — reconciliation never runs | Drift accumulates | Eventually yes (over-count path) | No | Verify `@EnableScheduling` scope (Assumption 6) |
+
+**Why negative counter does not block jobs (EC-1A, EC-1B):**
+The check is `current != null && current <= maxGlobalConcurrentJobs`. A negative value always
+satisfies `≤ 3`, so acquisitions are allowed freely — the semaphore becomes fail-open until
+enough INCRs push the counter back above zero. This is the correct safe-default behaviour.
+
+**Why EC-4 is the only case with no self-recovery:**
+`reconcileSemaphoreCounter(totalRunning)` calls `SET counter = countByStatus(RUNNING)`.
+During an EC-4 deadlock, no jobs are RUNNING (all are being rejected), so `totalRunning = 0`
+and `SET counter = 0`. The counter stays at 0. The next INCR produces 1, which is `> 0` (max),
+so the pod DECRs back to 0 and rejects. The deadlock is perpetual until operator intervention.
+
+#### EC-4 Fix — Clamp to 1 in `tryAcquireSemaphore` (Required)
+
+Implementer **must** apply `Math.max(1, maxGlobalConcurrentJobs)` as the effective limit inside
+`tryAcquireSemaphore`. A misconfigured value of 0 (or negative) silently becomes 1 — the pod
+continues to function, processes jobs one at a time, and logs a WARN so ops can see and correct
+the env var without any service disruption:
+
+```java
+private boolean tryAcquireSemaphore(String jobId, Long orgId) {
+    try {
+        int effectiveMax = Math.max(1, maxGlobalConcurrentJobs);   // EC-4: clamp; never deadlock
+        if (effectiveMax != maxGlobalConcurrentJobs) {
+            log.warn("expiry.date.change.max.global.concurrent.jobs={} is invalid; "
+                     + "clamped to 1", maxGlobalConcurrentJobs);
+        }
+        Long current = redisTemplate.opsForValue().increment(SEMAPHORE_KEY);
+        if (current != null && current <= effectiveMax) { ... }
+        ...
+    }
+}
+```
+
+**Why clamp instead of fail-fast (`@PostConstruct` throwing):**
+Stopping the pod on a misconfiguration means zero expiry jobs run until the env var is corrected
+and pods are restarted — a worse outcome than running at throughput=1. Clamping to 1 keeps the
+system functional, limits MongoDB load to the safest possible concurrency (1 job at a time),
+and surfaces the problem via a WARN log rather than a crash.
+
+#### EC-1B Detail — Fail-open Acquire + Successful Release (Under-count Drift)
+
+```
+t=0  Counter = 2 (2 jobs running)
+t=1  Redis briefly unavailable
+t=2  Pod 4: tryAcquireSemaphore → INCR throws → catch → return true
+     ← NO INCR sent to Redis
+t=3  Pod 4 runs the job
+t=4  Redis recovers
+t=5  Pod 4 finishes → releaseSemaphore → DECR → counter = 1
+Net: 3 jobs ran, counter says 1. Under-count by 1 per occurrence.
+```
+
+Behaviour: semaphore allows slightly more jobs than intended (opposite of pod-crash over-count).
+Recovery: hourly reconciliation corrects. No code change needed — documented here for
+test-plan-architect awareness (test: stub increment to throw, verify DECR still called in finally).
 
 ---
 
@@ -535,8 +609,16 @@ below pod count; that remains Option A's responsibility.
 Maintain a running count in a MongoDB document instead of Redis. Atomic `findAndModify` with
 `$inc` + conditional on max threshold.
 
-**Why not chosen:** Adds MongoDB read/write on every job start/end — adds to the load we are
-specifically trying to reduce. Redis is already in the path and is the correct tier for this.
+**Design equivalence to Option A:** This is the **same counter semaphore pattern as Option A**
+— atomic increment, compare-against-max, allow or decrement-and-reject, decrement on release.
+The mechanics are identical. The only difference is the storage tier: MongoDB (Option E) vs
+Redis (Option A).
+
+**Why not chosen:** Tier mismatch — MongoDB is the resource under pressure that this change is
+specifically trying to protect. Adding a `findAndModify` round-trip on every job start and
+every job end adds to the MongoDB load we are reducing. Redis is already present, has sub-
+millisecond latency for counter operations, and is the correct tier for lightweight coordination
+primitives. Same design, wrong storage choice.
 
 ---
 
@@ -548,7 +630,7 @@ specifically trying to reduce. Redis is already in the path and is the correct t
 | B — RedisLockRegistry slot | ❌ Hard 60 s TTL (no renewal in 5.3.6) | ✅ | ✅ Yes | Auto (TTL expiry) | Unsafe for jobs > 60 s |
 | C — SET NX EX slot | ❌ Hard TTL at acquisition | ✅ | ✅ Yes | Auto (TTL expiry) | Unsafe — dropped |
 | D — dedicated factory (isolation) | None | ❌ Per-pod only | ✅ Yes | N/A | Included — protective isolation from global setting changes, not a throttle |
-| E — MongoDB advisory | None | ✅ | ❌ Extra load | N/A | Wrong tier |
+| E — MongoDB advisory | None | ✅ | ❌ Extra load | N/A | Same counter pattern as A — wrong tier (adds load to the resource being protected) |
 
 ---
 
@@ -558,12 +640,16 @@ specifically trying to reduce. Redis is already in the path and is the correct t
 |------|--------|
 | `AbstractExpiryDateChangeDao.java` | Phase 1: `group().push(_id)` instead of `group().last(_id)`. Phase 2: `$in(batchIds)` criteria. Loop: extract List, setStartId to last element. Method signature: `ObjectId endId` → `List<ObjectId> batchIds`. Remove `END_ID` constant, add `BATCH_IDS` constant. Remove redundant `sort` stage (index already sorted). Remove stale `ObjectId endId` field declaration (line 60). |
 | `CustomerEarnedCollectionDynamicExpiryDateChangeDao.java` | `updateValidTillDate()` override: same signature change, replace range criteria with `Criteria.where(ID_COLUMN).in(batchIds)`. AggregationUpdate pipeline itself unchanged. |
-| `SpringAmqpConfig.java` | Add `expiryDateChangeContainerFactory` bean. Inject `RabbitListenerContainerFactoryConfigurer`, call `configurer.configure()` first, then pin `concurrentConsumers=1`, `maxConcurrentConsumers=1`, `prefetchCount=1`. Purpose: protective isolation from future global setting changes driven by redemption or other flows. |
+| `SpringAmqpConfig.java` | Add `expiryDateChangeContainerFactory` bean. Inject `RabbitListenerContainerFactoryConfigurer`, call `configurer.configure()` first (inherits message converter + error handler), then add custom `StatefulRetryOperationsInterceptor` with Fix-B `MessageRecoverer`, then pin `concurrentConsumers=1`, `maxConcurrentConsumers=1`, `prefetchCount=1`. Purpose: protective isolation + retry exhaustion observability. |
 | `ExpiryDateChangeJobListener.java` | Add `containerFactory = "expiryDateChangeContainerFactory"` to `@RabbitListener`. |
-| `ExpiryDateChangeJobFacade.java` | Inject `@Qualifier("cacheEvictionRedisTemplate") RedisTemplate<String,String>`. Add `tryAcquireSemaphore(orgId, jobId)` with fail-open catch. Add `releaseSemaphore(orgId, jobId)` with fail-safe catch. Add `reconcileSemaphoreCounter(actualRunning)` (called by Helper post-loop). Wrap `changeExpiryForPromotion()` in try-finally with semaphore acquire/release. |
+| `ExpiryDateChangeJobFacade.java` | Inject `@Qualifier("cacheEvictionRedisTemplate") RedisTemplate<String,String>`. Add `tryAcquireSemaphore(orgId, jobId)` with fail-open catch. Add `releaseSemaphore(orgId, jobId)` with fail-safe catch. Add `reconcileSemaphoreCounter(actualRunning)` (called by Helper post-loop). Wrap `changeExpiryForPromotion()` in try-finally with semaphore acquire/release. On rejection: transition job to `WAITING` (updates `lastUpdatedOn`), throw `SemaphoreRejectedException`. Update `shouldProceed()` to also allow `WAITING` status. |
+| `ExpiryDateChangeJobService.java` | **`markAllJobAsExpiredIfNotRunning()`:** Add second query for `WAITING` jobs with **2-hour** expiry threshold (separate from 24h for OPEN/RUNNING; see Operational Robustness section). **`isJobRunningForPromotion()`:** Add `WAITING` to the status list so a duplicate job is not created while an existing job is throttle-retrying. |
 | `ExpiryDateChangeHelper.java` | Inject `ExpiryDateChangeJobFacade` (new dependency — no cycle confirmed). Accumulate `countByStatus(RUNNING)` per shard during existing loop. Call `expiryDateChangeJobFacade.reconcileSemaphoreCounter(totalRunning)` after loop. |
 | `ExpiryDateChangeJobDao.java` | Add `long countByStatus(BatchStatus status)` — derived query, covered by existing `{status:1}` index on `ExpiryDateChangeJob`. |
-| `application.properties` | Add `expiry.date.change.max.global.concurrent.jobs=${EXPIRY_MAX_GLOBAL_CONCURRENT_JOBS:3}`. |
+| `BatchStatus.java` | Add `WAITING` enum value between `ERRORED` and `COMPLETED`. |
+| `SemaphoreRejectedException.java` | **NEW** — `extends RuntimeException`. Thrown by `ExpiryDateChangeJobFacade` when semaphore limit is hit. Allows `RMQMessageTrackerAspect` to distinguish throttle rejections from real failures. |
+| `RMQMessageTrackerAspect.java` | Add check: skip `metricsService.markAsFailedRequest()` when the caught exception is (or is caused by) `SemaphoreRejectedException`. Prevents NR failure counter from inflating on every retry attempt during normal throttle behaviour. |
+| `application.properties` | Add `expiry.date.change.max.global.concurrent.jobs=${EXPIRY_MAX_GLOBAL_CONCURRENT_JOBS:3}`. Add retry param properties used by the custom retry interceptor in the dedicated factory. |
 
 ## What Does NOT Change
 
@@ -571,7 +657,6 @@ specifically trying to reduce. Redis is already in the path and is the correct t
 - `CustomerEarnedCollectionStaticExpiryDateChangeDao` — inherits abstract class, no change.
 - `CodeBasedPromotionCollectionStaticExpiryDateChangeDao` — inherits abstract class, no change.
 - All three `ExpiryDateChangeProcessor` implementations — no change.
-- `ExpiryDateChangeJobFacade.shouldProceed()` — no change.
 - All collection indexes — no change.
 - RMQ queue/exchange/binding declarations — no change.
 - Duplicate job prevention logic in `PromotionFacade.updatePromotion()` — no change (already correct).
@@ -598,6 +683,165 @@ specifically trying to reduce. Redis is already in the path and is the correct t
 
 ---
 
+---
+
+## Operational Robustness — WAITING Status, Fix-A, Fix-B
+
+Three additional changes are agreed to correct NR metric noise, ensure jobs are not prematurely expired
+during the retry window, and provide a clean signal when retries are exhausted.
+
+---
+
+### WAITING Status — Prevent Premature EXPIRED During Throttle Retry
+
+**Problem:** When `tryAcquireSemaphore()` returns `false`, `changeExpiryForPromotion()` throws
+a `RuntimeException` and Spring AMQP schedules a retry. During the retry window (~17 min), the
+job sits in its previous status (`OPEN` or `ERRORED`) with its `lastUpdatedOn` unchanged.
+If the job was already close to the 24-hour expiry threshold (e.g., last updated 23h ago due to
+slow processing or a prior ERRORED state), the hourly `markAllJobAsExpiredIfNotRunning()` scheduler
+could expire the job before all retry attempts are exhausted — permanently losing it.
+
+**Solution:** On semaphore rejection, transition the job to `WAITING` status (via
+`updateExpiryDateChangeJobStatus(job, WAITING)`) BEFORE throwing `SemaphoreRejectedException`.
+This updates `lastUpdatedOn` to NOW, resetting the 24-hour clock. On every subsequent retry
+that again hits the semaphore limit, the job transitions back to `WAITING` and `lastUpdatedOn`
+is refreshed again. The 24-hour expiry clock can never fire while a job is actively retrying.
+
+**State machine changes:**
+```
+OPEN  ──(semaphore acquired)──→ RUNNING ──(success)──→ COMPLETED
+OPEN  ──(semaphore rejected)──→ WAITING ──(next retry, acquired)──→ RUNNING
+WAITING ──(next retry, rejected again)──→ WAITING  [loop, lastUpdatedOn refreshed]
+WAITING ──(retries exhausted)── [WAITING, orphaned] ──(2h expiry)──→ EXPIRED
+ERRORED ──(semaphore acquired on retry)──→ RUNNING
+```
+
+**`shouldProceed()` must allow WAITING:**
+```java
+// BEFORE
+return job.getStatus().equals(BatchStatus.OPEN)
+    || job.getStatus().equals(BatchStatus.ERRORED);
+
+// AFTER
+return job.getStatus().equals(BatchStatus.OPEN)
+    || job.getStatus().equals(BatchStatus.ERRORED)
+    || job.getStatus().equals(BatchStatus.WAITING);
+```
+
+Without this change, a job in WAITING status would be silently dropped on the next retry attempt
+(the `shouldProceed` check returns `false` → early return → message consumed but job never runs).
+
+**`markAllJobAsExpiredIfNotRunning()` expiry threshold for WAITING:**
+WAITING jobs require a SHORTER orphan threshold than OPEN/RUNNING jobs because:
+- Active retrying: `lastUpdatedOn` refreshed every retry attempt (seconds to minutes) → never hits any threshold
+- Orphaned WAITING (pod died mid-retry): no more updates → threshold signals it is dead
+
+The retry window is ~17 minutes maximum. A 2-hour threshold is conservative (7× the window)
+while still being far shorter than 24h, allowing orphaned WAITING jobs to be detected and
+expired the same day rather than lingering for up to 48h (24h idle + 24h scheduler lag):
+
+```java
+// NEW second loop in markAllJobAsExpiredIfNotRunning():
+List<ExpiryDateChangeJob> waitingJobs = expiryDateChangeJobDao.findByStatusIn(
+        Lists.newArrayList(BatchStatus.WAITING));
+waitingJobs.forEach(job -> {
+    long hoursDiff = TimeUnit.HOURS.convert(
+        Math.abs(new Date().getTime() - job.getAttribution().getLastUpdatedOn().getTime()),
+        TimeUnit.MILLISECONDS);
+    if (hoursDiff > 2) {    // 2h >> 17-min retry window; orphaned if exceeded
+        job.setStatus(BatchStatus.EXPIRED);
+        job.getAttribution().setLastUpdatedOn(new Date());
+        expiryDateChangeJobDao.save(job);
+    }
+});
+```
+
+**`isJobRunningForPromotion()` must include WAITING:**
+This method guards the API layer against creating duplicate jobs for the same promotion.
+Currently queries `OPEN + RUNNING`. If a job transitions to `WAITING`, the API layer no longer
+sees it as "running" and could create a second job for the same promotion during the retry window,
+producing two concurrent jobs that both process the same documents.
+
+```java
+// BEFORE
+Lists.newArrayList(BatchStatus.OPEN, BatchStatus.RUNNING)
+
+// AFTER
+Lists.newArrayList(BatchStatus.OPEN, BatchStatus.RUNNING, BatchStatus.WAITING)
+```
+
+---
+
+### Fix-A — SemaphoreRejectedException (NR Metric Noise)
+
+**Problem:** `RMQMessageTrackerAspect` fires `metricsService.markAsFailedRequest()` on ANY
+exception thrown by the listener. With `maxGlobalConcurrentJobs=3` and 600 queued messages,
+up to 3 pods × 10 retry attempts = 30 `markAsFailedRequest()` calls per promotion batch update
+from semaphore throttling alone — pure noise that drowns real failures in NR dashboards and alerts.
+
+**Solution:** Create `SemaphoreRejectedException extends RuntimeException`. Throw it instead of
+a generic `RuntimeException` when `tryAcquireSemaphore()` returns `false`. Update
+`RMQMessageTrackerAspect` to skip `markAsFailedRequest()` when the root cause is
+`SemaphoreRejectedException`:
+
+```java
+// RMQMessageTrackerAspect — add before markAsFailedRequest():
+if (throwable instanceof SemaphoreRejectedException
+        || (throwable.getCause() instanceof SemaphoreRejectedException)) {
+    log.debug("Semaphore rejection — not a failure metric: {}", throwable.getMessage());
+    return;
+}
+metricsService.markAsFailedRequest(...);
+```
+
+Spring AMQP wraps listener exceptions in a `ListenerExecutionFailedException`, so both
+`throwable instanceof SemaphoreRejectedException` and `throwable.getCause()` checks are needed.
+
+---
+
+### Fix-B — MessageRecoverer (Retry Exhaustion Observability)
+
+**Problem:** When all 10 retry attempts are exhausted (after ~17 min), the message is silently
+discarded (no DLQ configured). There is no log, no NR event, and no alert. Ops have no way to
+know a job has permanently failed.
+
+**Solution:** Configure a `MessageRecoverer` on `expiryDateChangeContainerFactory`. This hook
+is called exactly once by Spring AMQP when the retry policy is exhausted. It logs an `ERROR`
+and emits a NR custom event so the ops team is notified:
+
+```java
+// In expiryDateChangeContainerFactory() — after configurer.configure():
+StatefulRetryOperationsInterceptor retryInterceptor = RetryInterceptorBuilder.stateful()
+    .maxAttempts(retryMaxAttempts)                     // @Value from existing retry config
+    .backOffOptions(retryInitialInterval, retryMultiplier, retryMaxInterval)
+    .recoverer((message, cause) -> {
+        log.error("Expiry job exhausted all {} retry attempts — message discarded. cause={}",
+                  retryMaxAttempts, cause.getMessage(), cause);
+        metricsService.markAsFailedRequest(EXPIRY_JOB_RETRY_EXHAUSTED_NR_EVENT);
+    })
+    .build();
+factory.setAdviceChain(retryInterceptor);
+// NOTE: setAdviceChain() replaces the chain set by configurer.configure().
+// Message converter and error handler (set by configurer) are unaffected.
+// Retry config values must be injected via @Value and must match global retry props.
+```
+
+**New NR event name constant:** `NewrelicConstants.EXPIRY_JOB_RETRY_EXHAUSTED_EVENT`
+= `"expiry_job_retry_exhausted"` — enables a NR alert: if this event fires, ops can investigate
+and replay via the Admin API (Option 2 — not in scope of this change but documented below).
+
+**Option 2 — DLQ Replay via Admin API (documented, not in this PR's scope):**
+Once Fix-B emits the NR event and ops identify the affected jobId from the ERROR log, the
+Admin API can reset the job:
+1. Read the job by ID from MongoDB
+2. Reset `status → OPEN`, `startId → new ObjectId("000000000000000000000000")`
+3. Re-publish to `PROMOTION_EXPIRY_UPDATE_QUEUE`
+
+This is a manual-replay mechanism. No DLQ queue is required. The Admin API endpoint is deferred
+to a separate PR/ticket.
+
+---
+
 ## Risks for Implementer
 
 | Risk | Likelihood | Mitigation |
@@ -606,9 +850,13 @@ specifically trying to reduce. Redis is already in the path and is the correct t
 | Redis semaphore counter drifts negative if `releaseSemaphore` called without matching acquire | Low — `finally` block always releases; only mis-path is `tryAcquireSemaphore` returns false (no acquire issued, no release needed) | Review all exception paths in `changeExpiryForPromotion` |
 | Stateless RMQ retry exhausted (10 attempts) before semaphore frees — message lost | Low at default `max.global.concurrent.jobs=3`; total retry window ~17 min covers all realistic job durations. Becomes a real risk only if limit is dropped to 1–2 with very long-running jobs. | Do not set `maxGlobalConcurrentJobs` below 2 without also increasing `max-attempts` or `initial-interval`. |
 | Redis unavailable — `INCR/DECR` throws, all expiry jobs fail their retry window | Low — Redis `incentives` cluster is HA; resolved by fail-open pattern in `tryAcquireSemaphore` | Catch all exceptions in semaphore acquire/release and return true (fail-open). Already in final design. |
+| Redis Sentinel restart with no persistence (AOF/RDB disabled) — counter key lost mid-batch | **Medium** — If Redis restarts without persistence, `running_count` key is lost (resets to 0). New jobs see a fresh counter and acquire normally (correct). But in-flight jobs that already incremented the counter will call `releaseSemaphore` (DECR) on a zero-baseline key, driving the counter negative. Interleaved with new acquisitions, up to all 6 pods can run concurrently for the period between restart and the next hourly reconciliation — same as today before this fix. | **(1) Acknowledge as bounded fail-open:** behaviour is identical to the existing Redis-unavailable fail-open path; MongoDB load temporarily reverts to today's baseline, self-corrects within ≤1 hour via reconciliation. **(2) Optional mitigation — seed counter on startup:** add a call to `reconcileSemaphoreCounter(countByStatus(RUNNING))` in an `@EventListener(ApplicationReadyEvent.class)` on each pod startup. On restart, each pod reads actual RUNNING jobs from MongoDB and sets the counter before processing begins, eliminating the drift window. Confirm with infra team whether AOF is enabled; if so this risk is negligible. |
 | Dedicated container factory silently loses retry policy | **Resolved** — `RabbitListenerContainerFactoryConfigurer.configure()` called first in factory bean. No prior configurer usage existed in codebase; omitting it silently drops the retry policy. Pattern is specified in the Layer 1 snippet above. |
 | `CustomerEarnedCollectionDynamicExpiryDateChangeDao.updateValidTillDate()` method visibility | Low — currently `protected`; signature change must maintain visibility | Keep `protected`, update test accordingly |
 | Redis key namespace collision on shared `incentives` cluster | Low — `"promotion_engine:expiry_job:running_count"` is specific; no TTL required | Verify namespace with infra team before deploy |
+| **EC-4: `maxGlobalConcurrentJobs=0` or negative misconfiguration — permanent deadlock without a guard** | **Low likelihood, HIGH impact** — a typo (`EXPIRY_MAX_GLOBAL_CONCURRENT_JOBS=0`) causes all jobs to be rejected forever; reconciliation writes 0 each hour, preserving the deadlock. | **Required fix:** `int effectiveMax = Math.max(1, maxGlobalConcurrentJobs)` inside `tryAcquireSemaphore`. Invalid value silently becomes 1 (safest concurrency). Log WARN so ops can see and correct the env var without service disruption. Stopping the pod is explicitly rejected — zero job processing is worse than single-job processing. |
+| **WAITING + `isJobRunningForPromotion()` gap — duplicate jobs created during retry window** | **Medium likelihood, HIGH impact** — If `isJobRunningForPromotion()` does not include `WAITING` in its status list, a second `updatePromotion()` API call for the same promotion while the first job is WAITING (retrying) creates a duplicate job. Both jobs process the same promotion documents, producing double updates. | **Required fix:** Add `BatchStatus.WAITING` to `Lists.newArrayList(BatchStatus.OPEN, BatchStatus.RUNNING, BatchStatus.WAITING)` in `ExpiryDateChangeJobService.isJobRunningForPromotion()`. See Operational Robustness section. |
+| **Fix-B `setAdviceChain()` replaces `configurer.configure()` retry chain** | **Low likelihood** — calling `factory.setAdviceChain(retryInterceptor)` after `configurer.configure()` replaces the retry advice set by the configurer. If retry `@Value` params are not injected in `SpringAmqpConfig`, the custom interceptor silently uses different retry settings than the rest of the app. | **Required:** Inject all retry props (`RABBITMQ_RETRY_MAX_ATTEMPTS`, `RABBITMQ_RETRY_INITIAL_INTERVAL_MS`, `RABBITMQ_RETRY_MULTIPLIER`, `RABBITMQ_RETRY_MAX_INTERVAL_MS`) via `@Value` into `SpringAmqpConfig` and wire them into the custom `StatefulRetryOperationsInterceptor`. |
 
 ---
 
@@ -625,6 +873,11 @@ specifically trying to reduce. Redis is already in the path and is the correct t
 - [x] ~~Target value for `EXPIRY_MAX_GLOBAL_CONCURRENT_JOBS` in prod.~~
   **Resolved:** Default set to **3** (half of 6 pods). Raise to 6 to disable throttling post-deploy
   if MongoDB headroom permits; lower to 2 only with retry window review.
+- [ ] Should the WAITING job expiry threshold (2h) be configurable via `EXPIRY_WAITING_JOB_EXPIRY_HOURS`?
+  **Owner:** Tech lead — hardcoded constant is acceptable (derived from retry window ≈ 17 min);
+  make configurable only if per-environment fine-tuning is expected.
+- [ ] Should `NewrelicConstants.EXPIRY_JOB_RETRY_EXHAUSTED_EVENT` trigger an automated NR alert?
+  **Owner:** Saravanan — configure alert threshold and notification channel post-deploy.
 
 ---
 
