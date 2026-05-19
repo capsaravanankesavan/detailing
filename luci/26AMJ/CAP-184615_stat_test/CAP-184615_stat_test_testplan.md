@@ -27,6 +27,9 @@ and multi-operation sequences with historical blueprint data.
 | FR-011 | upload → issue → revoke → issue sequence: `numTotal` and `num_issued` reflect blueprint history correctly across all steps |
 | FR-012 | issue → redeem → reactivate sequence: RC limit correctly reduces after reactivation (historical RRC offsets effective RC); `num_redeemed` = `(summary_RC − summary_RRC) + blueprint_RC` |
 | FR-013 | upload → redeem → reactivate sequence: `numTotal` + `num_redeemed` via getAllCouponConfigurations correctly combine blueprint TC/RC with today's summary |
+| FR-014 | On a single DISC_CODE_PIN series, mixed uploads (NONE importType + USER_ID importType) must be counted correctly: `numTotal` += both; `num_uploaded_total` += both; `num_issued` += only USER_ID uploads (pre-assigned) + API-issued; pool invariant `numTotal − num_issued` grows by `NONE_uploaded − API_issued` per run |
+| FR-015 | RC limit enforcement (`maxRedeem`) must reject the first redemption that would exceed the series limit with errorCode=605, even on a long-running series with accumulated historical RC. The limit is evaluated against the live today-path RC count. |
+| FR-016 | On a DISC_CODE_PIN series with `entityLevelRedemptionConfigEnabled=True`, all count fields (`numTotal`, `num_uploaded_total`, `num_issued`, `num_redeemed`) must be identical to a standard DISC_CODE_PIN series. OU-level redemption config must not distort aggregate stats. |
 
 ### Non-Functional Requirements
 
@@ -88,6 +91,8 @@ and multi-operation sequences with historical blueprint data.
 | UT-03 | FR-001 | `getLongFields()` excludes RIC and RRC (isMysql=true fields); `getMysqlLongFields()` includes them | `CouponSeriesStatisticsField` | No mocks — assert list sizes and membership | P1 |
 | UT-04 | FR-006 | `getHistoricalValue()` when no registry entry (returns null): falls back to `today − 100 days` as startDate, returns summary sum without NPE | `StatsHistoryServiceImpl` | Mock `findLastActiveByOrgId` → returns null; mock `statsSeriesSummaryDao.sumValuesForDateRange` → returns 7L; assert result = 7L, no NPE | P0 |
 | UT-05 | FR-004 | `bulkGetHistoricalValues()` returns blueprint values ONLY (not summary values); confirms the three-path split of `bulkFetchHistoryValues()` | `StatsHistoryServiceImpl` | Mock `statsHistoryDao.bulkFindHistoricalValues` → returns map with key=IC, value=20L; assert result map contains only the mocked key (no summary fan-out) | P1 |
+| UT-06 | FR-001, FR-002 | `getLastIssueTime` priority: when both `cachedStat.lastIssuedTime=T1 > 0` AND `historicalTimestamp=T2 > T1`, result must be `T1` (today-path `stats_series_summary` always wins over DataBricks blueprint). Regression guard against a `Math.max`-style refactor that would silently return the wrong timestamp. | `MySQLCouponSeriesStatisticsReadService` | `bulkFindByOrgIdAndSeriesIdsForDateRange` → stat with `lastIssuedTime=T1`; `bulkGetHistoricalValues` → map with `SeriesFieldKey(LastIssueTime) → T2` where `T2 > T1`; assert `result.getStatistics().get(LastIssueTime).getTime() == T1` | P1 |
+| UT-07 | FR-002, FR-007 | `getLastRedeemTime` OU-level entity guard: for an OU-scoped call (`redemptionEntityId != DEFAULT`), `cachedStat.lastRedeemedTime=T1 (non-zero)` is present but must be **ignored**; result must come from `historicalTimestamp=T2` instead. This asymmetry vs `getLastIssueTime` (which has no entity guard) is the key correctness invariant — removing the `redemptionEntityId == DEFAULT` check would break OU-level last-redeem-time without any existing test catching it. | `MySQLCouponSeriesStatisticsReadService` | `isEntityLevelRedemptionConfigEnabled=true`; `bulkFindByOrgIdAndSeriesIdsForDateRange` → stat with `lastRedeemedTime=T1`; `bulkGetHistoricalValues` → `HistoricalValueKey(orgId, seriesId, LastRedeemTime, "OU", ouId) → T2` (T2 ≠ T1); assert `result.getLastRedeemedTime(ouId).getTime() == T2` (not T1). The existing `EntityLevel_LastRedeemTime_RoutesToRegularKeys` test uses an empty cachedStat map so it does NOT catch this. | **P0** |
 
 > **Testing instinct:** Unit tests pin the contract of each method in isolation — when an IT fails, you know the issue is in wiring, not in method logic.
 
@@ -117,46 +122,41 @@ and multi-operation sequences with historical blueprint data.
 
 ---
 
-### Automation Tests — Development Cluster (`campaigns_auto/tests/luci/`)
+### Automation Tests (`campaigns_auto/tests/luci/` — runs in all clusters)
+
+> **No dev vs prod distinction.** All automation tests run in every cluster. The only execution gate
+> is `@pytest.mark.suiteType`: `smoke` = every hour, `sanity` = once per day, `regression` = once per week.
+> Tests are shielded from scheduled runs by `@pytest.mark.wip` until explicitly graduated.
+> Standard scheduled invocation filter: `-f "test and not wip"`.
 
 > **Fixture strategy — Month-based self-managing series**
 >
-> Each cluster uses two fixture series identified by a monthly seriesCode convention.
-> They are created automatically on the first test run of the month via
-> `getAllCouponConfigurations(seriesCodes=[monthly_code])` and are never deleted.
-> Because they accumulate data across runs, all count assertions use either:
+> Monthly series are identified by a `{PREFIX}_{year}_{month:02d}` code convention. They are
+> created automatically on the first run of the month via `getAllCouponConfigurations(seriesCodes=[code])`
+> and are never deleted. Because they accumulate data across runs, all count assertions use:
 > - **Delta pattern:** `api_after − api_before == N` — survives indefinite accumulation
-> - **Pipeline integrity pattern:** `api.num_issued == getCouponsIssued_Count(active=1)` — proves DataBricks has aggregated coupons_issued into blueprint+summary correctly
->
-> Monthly series codes:
-> - `STATS_GEN_{year}_{month:02d}` — DISC_CODE series (coupons auto-generated on issue; no upload needed)
-> - `STATS_DCP_{year}_{month:02d}` — DISC_CODE_PIN series (`uploadCoupons(N)` called on creation only)
->
-> **Pipeline integrity skip rule:** When `is_new=True` (series created this run), DataBricks has not yet
-> processed it. Skip the `api == db_active` assertion for that run only; the delta assertion still applies.
+> - **Pipeline integrity pattern:** `api.num_issued == getCouponsIssued_Count(active=1)` — proves DataBricks has aggregated correctly
 
-| ID | Req | Description | Series | Assertion Strategy | Dev-only? | Cleanup Required | Priority |
+| ID | Req | Description | Series | Assertion Strategy | suiteType | Cleanup Required | Priority |
 |----|-----|-------------|--------|--------------------|-----------|-----------------|----------|
-| AT-DEV-01 | FR-001, FR-002 | Pipeline integrity: `num_issued` and `num_redeemed` aggregate blueprint + summary + today correctly; proves DataBricks aggregation is live | `STATS_GEN_{year}_{month:02d}` (DISC_CODE). Get-or-create via `getAllCouponConfigurations(seriesCodes=[code])`. | **DB ground truth:** `before_db = getCouponsIssued_Count(active=1)`; **API baseline:** `before_api = api.num_issued`; issue N coupons → redeem M; assert `api.num_issued − before_api == N` (delta); assert `api.num_redeemed − before_api_rc == M` (delta); **Pipeline integrity (skip if is_new):** assert `api.num_issued == getCouponsIssued_Count(active=1)` | Yes | None — series accumulates across runs by design | P0 |
-| AT-DEV-02 | FR-009, FR-010 | Pipeline integrity: `numTotal` and `num_uploaded_total` aggregate blueprint TC/UTC correctly via DISC_CODE_PIN monthly series | `STATS_DCP_{year}_{month:02d}` (DISC_CODE_PIN). Get-or-create; call `uploadCoupons(N)` on first-creation only (check `is_new`). | **API baseline:** `before_api = api.numTotal`; upload M more coupons; assert `api.numTotal − before_api == M` (delta); **Pipeline integrity (skip if is_new):** assert `api.numTotal` reflects blueprint TC from prior DataBricks run (validate `api.numTotal > before_api` after upload confirms today-path write) | Yes | None — series accumulates across runs by design | P0 |
-| AT-DEV-03 | FR-001, FR-002, FR-005, FR-012 | Cross-day operation sequence using day-of-month parity: even days accumulate IC+RC only; odd days add RIC+RRC (with K_revoke > N_issue to use prior-day coupons). Over time exercises `sum(RIC_window) > sum(IC_window)` → negative `currentValue` in `getSumFromCache` → validates the unclamped path and DataBricks pipeline integrity | `STATS_SEQ_{year}_{month:02d}` (DISC_CODE, dedicated sequence series; separate from STATS_GEN to avoid polluting pipeline integrity counts). **Even day:** `issue(5)`, `redeem(3)` — expected deltas: +5, +3. **Odd day:** `issue(3)`, `redeem(2)`, `revoke(min(5, 3+pool))`, `reactivate(min(2, 2+prior_redeemed))` — expected issued delta: `3 − actual_K` (negative once pool has prior coupons); expected redeemed delta: `2 − actual_J`. Guard: first odd day of month uses `actual_K = N` if pool empty. | Delta assertion for both day types; **pipeline integrity (skip if is_new):** `api.num_issued == getCouponsIssued_Count(active=1)` — on odd days where `currentValue < 0`, this specifically catches any clamping regression (`Math.max(0, currentValue)` would make API > DB active → fail). ⚠️ Requires `getCouponsIssuedList(series_id, active=1, limit=K−N)` helper in `luciDBHelper.py` to fetch prior-day coupon codes for over-revoke; verify or add. | Yes | None — net active per 2-day cycle = +3; series grows slowly, never exhausts | P1 |
-| AT-DEV-04 | FR-003 | RC limit enforcement on a live cluster: fresh single-run series with `maxRedeem=3`; assert limit is enforced (success up to 3, errorCode=605 on 4th) | Fresh series per run (not monthly — needs a known small `maxRedeem`). Create with `maxRedeem=3`, issue 3 coupons, redeem all 3. | Issue 3 → redeem 3 → assert success (HTTP 200); attempt 4th redeem → assert HTTP 4xx with `errorCode=605` | Yes | Series naturally exhausts its limit; no deletion needed (all redeems already rejected) | P1 |
+| AT-DEV-01 | FR-001, FR-002 | Pipeline integrity: `num_issued` and `num_redeemed` aggregate blueprint + summary + today correctly; proves DataBricks aggregation is live. Also asserts `latestIssualTime` and `latestRedemptionTime` are populated and ≈ now after operations, proving `stats_series_summary` (today-path source) writes time fields correctly. | `STATS_GEN_{year}_{month:02d}` (DISC_CODE). Get-or-create. | `before_api = api.num_issued`; issue N → redeem M; assert `num_issued − before == N` (delta); assert `num_redeemed − before_rc == M` (delta); **pipeline integrity:** `api.num_issued == getCouponsIssued_Count(active=1)`; `api.num_redeemed == getCouponRedemptions_Count(series_id)` (active=1 only); **time fields (today-path):** `api.latestIssualTime` non-null and `now - latestIssualTime < 5 min`; `api.latestRedemptionTime` non-null and `now - latestRedemptionTime < 5 min` | **smoke** (hourly) | None — series accumulates by design | P0 |
+| AT-DEV-02 | FR-009, FR-010 | Pipeline integrity: `numTotal` and `num_uploaded_total` aggregate blueprint TC/UTC correctly via DISC_CODE_PIN monthly series | `STATS_DCP_{year}_{month:02d}` (DISC_CODE_PIN). Get-or-create; seed 10 NONE codes on `is_new`. | `before_api = api.numTotal`; upload M codes; assert `numTotal − before == M` (delta); assert `num_uploaded_total − before == M` (delta); pipeline integrity: `api.numTotal > before` confirms today-path write | **smoke** (hourly) | None — series accumulates by design | P0 |
+| AT-DEV-03 | FR-001, FR-002, FR-005, FR-012 | Cross-day sequence (day-of-month parity): even days issue+redeem only; odd days add revoke from prior pool, exercising negative `currentValue` in `getSumFromCache`. Catches `Math.max(0, currentValue)` clamping regression. | `STATS_SEQ_{year}_{month:02d}` (DISC_CODE). **Even:** issue(5), redeem(3). **Odd+pool:** issue(3), redeem(2), revoke(min(5, pool)); poll 90s for RIC convergence. | Delta assertions on both branches; **pipeline integrity on odd day:** `api.num_issued == getCouponsIssued_Count(active=1)` — API > DB active means clamping regression. | **regression** (weekly) — 90s RIC poll on odd days makes it too slow for hourly | None — net active per 2-day cycle = +3 | P1 |
+| AT-DEV-04 | FR-003 | RC limit enforcement: fresh series per run with `maxRedeem=3`; validate 3rd redemption succeeds and 4th fails with errorCode=605 | Fresh series per run (small known `maxRedeem`). Create → issue 1 → redeem 3x (success) → redeem 4th (fail 605). | `num_redeemed == 3` at limit; 4th redeem error `errorCode=605`; `num_redeemed` unchanged after rejection | **regression** (weekly) — creates a new series every run; too wasteful for hourly | Series exhausts its limit; no cleanup needed | P1 |
+| AT-DEV-05 | FR-014 | DISC_CODE_PIN mixed-upload (NONE + USER_ID) + API issue: validates `numTotal`, `num_uploaded_total`, `num_issued`, pool invariant, and pipeline integrity simultaneously. **Known bug:** `num_uploaded_total` does not count USER_ID uploads — acts as regression gate until fix lands. | `STATS_MIX_{year}_{month:02d}` (DISC_CODE_PIN). Seed 10 NONE on `is_new`. Per run: upload N1=5 (NONE) + N2=3 (USER_ID) + issue M=3 via API. | **Delta:** `numTotal` +8; `num_uploaded_total` +8; `num_issued` +6. **Pool invariant:** pool grows by N1−M=2. **Pipeline integrity:** `api.num_issued == getCouponsIssued_Count(active=1)`; `api.num_redeemed == getCouponRedemptions_Count(series_id)`. | **regression** (weekly) — currently fails (FR-014 bug); regression gate | None — pool grows 2 per run | P0 |
+| AT-DEV-06 | FR-003, FR-001, FR-002 | Combined pipeline integrity + RC limit enforcement on a long-running monthly series. Dynamic `maxRedeem = current_rc + 1` per run — no series accumulation. Validates: (a) at-limit redeem succeeds; (b) `api.num_redeemed == DB count` (pipeline integrity); (c) over-limit redeem fails 605; (d) `maxRedeem` reset to -1 after each run. | `STATS_SM_LMT_{year}_{month:02d}` (DISC_CODE). Get-or-create. Per run: read `current_rc`; set `maxRedeem = current_rc + 1`; issue A → redeem (at limit); issue B → redeem (605); reset `maxRedeem = -1`. | `api.num_redeemed == new_limit`; `api.num_redeemed == getCouponRedemptions_Count(series_id)` (active=1 only); second redeem `errorCode=605`; `maxRedeem` reset confirmed. | **smoke** (hourly) — fully idempotent; maxRedeem reset each run | maxRedeem reset to -1 after each run | P0 |
+| AT-DEV-07 | FR-002, FR-007 | DISC_CODE_PIN monthly series with `entityLevelRedemptionConfigEnabled=True` (OU-level redemptions). Validates all four count fields are correct when OU-level redemption config is active. Also asserts OU-level `latestRedemptionTime` (thrift `RedemptionConfig` field 22): for OU-scoped entities `getLastRedeemTime` skips `stats_series_summary` entirely and reads from DataBricks blueprint only — this is the only automation assertion that covers the DataBricks-blueprint source for time fields. | `STATS_OU_{year}_{month:02d}` (DISC_CODE_PIN + OU config). Seed 10 NONE on `is_new`. Per run: upload N=5 NONE + issue M=3 + redeem K=2 (OU-level path, **two different tills** — `tillIds[0]` and `tillIds[1]`, both mapping to the same `ouId`). Requires `self.ou_id = constant.config['ouId']`. | **Delta:** `numTotal` +5; `num_uploaded_total` +5; `num_issued` +3; `num_redeemed` +2. **Pipeline integrity:** `api.num_issued == getCouponsIssued_Count(active=1)`; `api.num_redeemed == getCouponRedemptions_Count(series_id)` (active=1 only); **OU-level delta:** `redemptionConfigs[ouId].num_redeemed` +K; **OU-level DB integrity:** `redemptionConfigs[ouId].num_redeemed == getCouponRedemptions_Count_ByOu(series_id, ouId)` — query filters `WHERE redemption_config_entity = 0 AND redemption_config_entity_id = ouId AND active = 1` (NOT by `redeemed_at_store`; this is till-agnostic and correctly aggregates across both tills). **OU time field (DataBricks-path):** if `not is_new`: `redemptionConfigs[ouId].latestRedemptionTime` is non-null — proves DataBricks blueprint populated the OU-scoped time field. | **smoke** (hourly) | None — pool grows by N−M=2 per run | P1 |
+| AT-DEV-08 | FR-003, FR-001, FR-002 | History-driven RC limit enforcement: persistent `STATS_RC_HIST` series with fixed `maxRedeem=5` (never reset). **Run 1** (new series): issues K=5 coupons to K users, redeems all → RC at limit; over-limit redeem fails 605. **Run 2+** (steady state): issues coupon to dedicated over-limit user (gets existing unspent code via `do_not_resend`); redeem fails 605 immediately because `getSumFromCache` reports `num_redeemed ≥ 5` from history. After DataBricks cycles, the limit is enforced from DataBricks blueprint data, not live `coupon_redemptions`. Also asserts: (a) `api.num_redeemed == DB count` pipeline integrity; (b) `latestRedemptionTime` does not change after 605 failure — proving failed redemptions do not mutate the time field and that the value is frozen historical data. | `STATS_RC_HIST` (persistent, not month-scoped, `maxRedeem=5`, never modified). | **Run 1:** `num_redeemed ≥ 5` after K redeems; over-limit 605; `api.num_redeemed == DB count`. **Run 2+:** 605 immediately; `api.num_redeemed ≥ 5`; `api.num_redeemed == DB count`; `latestRedemptionTime` before == `latestRedemptionTime` after (frozen by failed attempt). | **regression** (weekly) — first run creates persistent state; subsequent runs are fast but semantically a regression test | Over-limit coupon left unspent (by design — reused on next run) | P1 |
 
-> **RC limit boundary vs. blueprint history:** AT-DEV-04 covers today-path RC limit only (fresh series, no blueprint RC).
-> RC limit enforcement **with blueprint history** is P0-covered by IT-01. If DataBricks pipeline RC aggregation is
-> suspected, AT-DEV-01's `num_redeemed` delta + pipeline integrity assertion is the cluster-level signal to use.
+> **RC limit boundary vs. blueprint history:** AT-DEV-04 covers today-path RC limit (fresh series). AT-DEV-06 is the
+> hourly smoke that keeps the limit check alive on long-running cluster state. AT-DEV-08 is the long-lived regression
+> that proves history-driven RC enforcement: once the series exhausts its fixed limit, subsequent runs verify that
+> `getSumFromCache` reading from DataBricks blueprint tables correctly blocks redemptions.
+> RC limit enforcement **with blueprint history seeded via `insertHistoricalStatsData`** is P0-covered by IT-01.
 
 > **Paths not coverable in Python automation:** Revoke-then-issue against blueprint history and OU-level RC limit
 > with blueprint OU-RC require blueprint seeding (`insertHistoricalStatsData`) which has no Python equivalent.
 > These remain IT-only coverage areas (IT-05, IT-08).
-
----
-
-### Automation Tests — Production Cluster (prod-safe)
-
-| ID | Req | Description | Prod-safe? | Validation Method | Priority |
-|----|-----|-------------|-----------|-------------------|----------|
-| AT-PROD-01 | NFR-001 | Health-check: `getAllCouponConfigurations` on a known production series returns non-zero `num_issued`; validates stats read path is live | Yes — read-only | Assert HTTP 200 and `num_issued > 0` for a known high-volume series | P2 |
 
 ---
 
@@ -184,17 +184,17 @@ and multi-operation sequences with historical blueprint data.
 
 ## Test Data Requirements
 
-### Automation Fixture Series (monthly self-managing — AT-DEV-01–03 only)
+### Automation Fixture Series (monthly self-managing — AT-DEV-01–03, AT-DEV-05–07)
 
-| Field | DISC_CODE pipeline (AT-DEV-01) | DISC_CODE_PIN pipeline (AT-DEV-02) | Cross-day sequence (AT-DEV-03) |
-|-------|-------------------------------|-----------------------------------|-------------------------------|
-| seriesCode | `STATS_GEN_{year}_{month:02d}` | `STATS_DCP_{year}_{month:02d}` | `STATS_SEQ_{year}_{month:02d}` |
-| client_handling_type | DISC_CODE | DISC_CODE_PIN | DISC_CODE |
-| maxRedeem | -1 (unlimited) | -1 (unlimited) | -1 (unlimited) |
-| Creation | `getAllCouponConfigurations(seriesCodes=[code])` — get or create | Same; `uploadCoupons(N)` on `is_new=True` | Same as STATS_GEN |
-| Lifecycle | Accumulates all month; new series on month rollover | Same | Same |
-| Deletion | Never deleted | Never deleted | Never deleted |
-| Purpose | Pure IC/RC pipeline integrity | TC/UTC pipeline integrity | Cross-day RIC/RRC distribution; negative currentValue path |
+| Field | DISC_CODE pipeline (AT-DEV-01) | DISC_CODE_PIN upload-only (AT-DEV-02) | Cross-day sequence (AT-DEV-03) | Mixed-upload (AT-DEV-05) | RC limit smoke (AT-DEV-06) | OU-level counts (AT-DEV-07) |
+|-------|-------------------------------|---------------------------------------|-------------------------------|--------------------------|---------------------------|------------------------------|
+| seriesCode | `STATS_GEN_{year}_{month:02d}` | `STATS_DCP_{year}_{month:02d}` | `STATS_SEQ_{year}_{month:02d}` | `STATS_MIX_{year}_{month:02d}` | `STATS_SM_LMT_{year}_{month:02d}` | `STATS_OU_{year}_{month:02d}` |
+| client_handling_type | DISC_CODE | DISC_CODE_PIN | DISC_CODE | DISC_CODE_PIN | DISC_CODE | DISC_CODE_PIN |
+| maxRedeem | -1 (unlimited) | -1 (unlimited) | -1 (unlimited) | -1 (unlimited) | Dynamic: `current_rc+1` during test; reset to -1 after | -1 (unlimited) |
+| Creation | `getAllCouponConfigurations(seriesCodes=[code])` — get or create | Same; upload 10 NONE codes on `is_new=True` | Same as STATS_GEN | Same; upload 10 NONE codes on `is_new=True` | `_get_or_create_monthly_series` | `_get_or_create_ou_monthly_series` — includes `entityLevelRedemptionConfigEnabled=True` and per-OU redemption config |
+| Lifecycle | Accumulates all month; new series on month rollover | Same | Same | Same | Same | Same |
+| Deletion | Never deleted | Never deleted | Never deleted | Never deleted | Never deleted | Never deleted |
+| Purpose | Pure IC/RC pipeline integrity | TC/UTC pipeline integrity (NONE uploads only) | Cross-day RIC/RRC; negative currentValue path | Mixed NONE+USER_ID upload correctness; pool invariant; FR-014 bug regression gate | Hourly smoke: RC limit enforcement + pipeline integrity on live cluster | OU-level redemption count correctness (numTotal / num_uploaded_total / num_issued / num_redeemed) |
 
 **Two-layer assertion pattern (Python):**
 ```python
@@ -222,6 +222,12 @@ if not is_new:
 > **Why `api == db_active` is the pipeline gate:** `getCouponsIssued_Count(active=1)` reads from `coupons_issued`
 > directly. DataBricks reads the same table to build blueprint IC. If `api.num_issued != db_active`, then
 > blueprint IC is stale or the summary aggregation is wrong. This is the assertion that cannot be made by ITs.
+
+> **`getCouponRedemptions_Count` filters `active = 1`:** Reversed/reactivated redemptions remain as rows in
+> `coupon_redemptions` with `active = 0`. The API formula `num_redeemed = (RC − RRC) + blueprint_RC` nets to
+> the `active=1` count, so querying all rows would produce a gap equal to the historical RRC value. All pipeline
+> integrity assertions for `num_redeemed` use the `active=1`-filtered count. The `getCouponRedemptions_Count_ByOu`
+> helper for OU-level assertions applies the same `active = 1` filter.
 
 **Day-parity pattern for STATS_SEQ series (AT-DEV-03):**
 
@@ -447,16 +453,21 @@ GET API after 10 successful redeems, 3 reactivations:
 
 ## Test Coverage Summary
 
-| Layer | Count | % of Total |
-|-------|-------|-----------|
-| Unit | 5 (UT-01–UT-05) | ~24% |
-| Integration | 10 (IT-01–IT-10) | ~48% |
-| Automation (dev) | 4 (AT-DEV-01–04) | ~14% |
-| Automation (prod) | 1 (AT-PROD-01) | ~5% |
-| Regression | 4 (RG-01–04) | ~19% |
-| **Total distinct** | **~22** | **100%** |
+| Layer | Count | % of Total | suiteType cadence |
+|-------|-------|-----------|-------------------|
+| Unit | 7 (UT-01–UT-07) | ~21% | n/a (mvn test) |
+| Integration | 10 (IT-01–IT-10) | ~38% | n/a (mvn test) |
+| Automation — smoke | 4 (AT-DEV-01, 02, 06, 07) | ~15% | every hour, all clusters |
+| Automation — regression | 4 (AT-DEV-03, 04, 05, 08) | ~15% | once per week, all clusters |
+| Regression (cross-layer) | 4 (RG-01–04) | ~15% | part of UT/IT runs |
+| **Total distinct** | **~26** | **100%** | |
 
-Requirements coverage: 13/13 FRs covered (100%), 3/3 NFRs covered (100%)
+Requirements coverage: 16/16 FRs covered (100%), 3/3 NFRs covered (100%)
+
+> **Time field coverage by source:**
+> - `stats_series_summary` (today-path, `cachedStat`): AT-DEV-01 series-level `latestIssualTime`/`latestRedemptionTime` ≈ now ✓
+> - DataBricks blueprint tables (history-path, `historicalTimestamp`): AT-DEV-07 OU-level `redemptionConfigs[ouId].latestRedemptionTime` non-null (after DataBricks cycles) ✓; AT-DEV-08 `latestRedemptionTime` unchanged after 605 failure ✓
+> - Unit coverage: UT-06 (cachedStat priority over history); UT-07 (OU-level entity guard — cachedStat ignored, history used)
 
 ---
 
@@ -501,7 +512,9 @@ Full coverage: add IT-05 (OU-level), UT-03 (getLongFields), UT-05 (bulkGet), AT-
 10. IT-05 (after spike) — OU-level; requires resolved Q3/Q4
 11. UT-03, UT-05        — supplementary unit tests
 12. AT-DEV-01–02 (P0)   — run post-deploy to QA; monthly series auto-created on first run; assert pipeline integrity after DataBricks has processed the series (is_new=False)
-13. AT-DEV-03–04 (P1)   — full operation sequence + RC limit boundary; run after AT-DEV-01/02 confirm pipeline is live
+13. AT-DEV-03–05 (P1)   — full operation sequence + mixed-upload correctness; run after AT-DEV-01/02 confirm pipeline is live
+14. AT-DEV-06 (P0 smoke) — hourly smoke: run on deploy and then every hour; monitors RC limit + pipeline integrity on live cluster
+15. AT-DEV-07 (P1)       — OU-level count validation; run after AT-DEV-06 confirms cluster is live
 ```
 
 ---
@@ -522,6 +535,9 @@ Full coverage: add IT-05 (OU-level), UT-03 (getLongFields), UT-05 (bulkGet), AT-
 - [ ] `deleteRedisByKeyPattern(MIDNIGHT_EXPIRING_CACHE_NAME + "*")` called in every new IT after seeding
 - [ ] AT-DEV-01 passes on QA cluster: `api.num_issued − before == N` (delta) and `api.num_issued == getCouponsIssued_Count(active=1)` (pipeline integrity, post-DataBricks run)
 - [ ] AT-DEV-02 passes on QA cluster: `api.numTotal − before == M` (delta) for DISC_CODE_PIN monthly series
+- [ ] AT-DEV-05 passes on QA cluster: `numTotal` +8, `num_uploaded_total` +8, `num_issued` +6, pool invariant +2 — all correct for mixed NONE+USER_ID upload on single series (currently fails due to FR-014 bug; becomes passing once `num_uploaded_total` tracking is fixed for USER_ID imports)
+- [ ] AT-DEV-06 passes on QA cluster: first redeem hits limit (success), `api.num_redeemed == DB coupon_redemptions` (pipeline integrity), second redeem correctly rejected with 605, `maxRedeem` reset to -1 after run
+- [ ] AT-DEV-07 passes on QA cluster: `numTotal` +5, `num_uploaded_total` +5, `num_issued` +3, `num_redeemed` +2 (all deltas) + both pipeline integrity assertions — with OU-level redemption config active
 
 ---
 
