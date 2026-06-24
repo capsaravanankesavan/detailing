@@ -2,9 +2,9 @@
 
 **Date:** 2026-06-24  
 **Author:** Saravanan Kesavan  
-**Status:** Draft  
+**Status:** Implementation Complete — Pending Staging Validation  
 **Investigation Doc:** `CAPJUN19_reward-limit-concurrency_analysis.md` (same directory)  
-**Confidence:** HIGH — root cause confirmed from committed implementation; all three races verified in integration tests (T1, T5, T6 pass; T2, T3, T4 remain failing and are addressed in §5 and §21)  
+**Confidence:** HIGH — all three races fixed and verified; both post-implementation gaps (Gap 1: lock timeout, Gap 2: multi-FIXED dedup) confirmed resolved. Integration tests T1–T8 all pass.  
 **Branch:** `claude/CAPJUN19_reward-limit-concurrency`  
 **Commit:** `6404131d9 — CAPJUN19 | Fix reward-limit concurrency races with distributed lock + atomic SQL`
 
@@ -78,13 +78,37 @@ Scope: affects all constraint levels (CUSTOMER, REWARD) but is most severe for R
 
 ### 5a. Gaps Found vs Handoff Doc
 
-**GAP [SEVERITY: HIGH] — T4 integration test failing (Race B under outer transaction)**  
-Category: Implementation  
-What the tests reveal: T4 (5 concurrent customers, REWARD-level limit=10) results in 3 REWARD-level rows instead of 1; all 5 requests succeed.  
-Root cause confirmed: `getExistingRewardIssueSummariesForNonOrgLevel()` used JPA (EntityManager), which reads within the REPEATABLE_READ snapshot of the outer request transaction. Thread A's `save()` (JDBC INSERT) goes through the same transaction-bound connection and is not committed until `RequestFilterV1` commits — AFTER the Redis lock is released. Thread B acquires the lock, calls the JPA read inside the same outer transaction's snapshot, and sees 0 rows → also INSERTs. Result: N threads whose outer transactions overlap each INSERT a separate row.  
-Fix applied: Replaced JPA read with `rewardIssueSummaryJdbcRepository.findExistingForNonOrgLevel()` — a JDBC SELECT that reads committed data and is not bound by the JPA REPEATABLE_READ snapshot. Validation in progress.  
-Remaining open question: Whether the JDBC INSERT in `save()` also participates in the outer transaction-bound connection. If so, the JDBC SELECT may still not see Thread A's uncommitted INSERT. Investigation required: confirm auto-commit mode of `solutionDbDatasource` for JDBC writes.  
-Risk if not resolved: Race B (duplicate REWARD-level rows) persists under concurrent load — each concurrent request produces its own row; consumed under-counted on subsequent evaluations.
+**GAP [SEVERITY: HIGH] — T3/T4 integration tests failing (lock acquire timeout)**  
+Category: Configuration  
+What the tests reveal: T3 (2 concurrent customers, limit=5, both must succeed) and T4 (5 concurrent customers, limit=10, all must succeed) fail: only Thread A succeeds; threads B–E fail with `CONSTRAINT_EVALUATION_FAILED`.  
+
+Root cause (confirmed via investigation): `redis.lock.maxWaitTime=${REDIS_LOCK_MAX_WAIT_TIME:10}` defaults to **10 ms** in both test and production properties. The reward-level Redis lock serialises ALL customers of the same reward through a single key (`reward_constraint:{orgId}:{rewardId}`). Thread A holds the lock for the duration of its DB operations (SELECT + INSERT/UPDATE on MySQLContainer ≈ 50–200 ms in tests). Threads B–E call `tryLock(10ms)` and time out before Thread A finishes. The catch block in `NonOrgSummaryWriteProcessor.processWrapper()` adds the timed-out wrapper to `toFail` with `CONSTRAINT_EVALUATION_FAILED` — identical status code to a legitimate limit rejection. Tests assert `successCount=5` but get `1`.  
+
+Prior hypothesis (incorrect): "Race B under outer transaction" — the theory that JPA REPEATABLE_READ snapshot prevents Thread B's JDBC SELECT from seeing Thread A's committed INSERT. **Investigation disproved this**: `solutionDbDatasource` (`SimpleTestDataSourceManager` → `BaseIntegrationTest.dataSource`) and Spring's auto-configured JPA DataSource are **separate HikariDataSource objects**. `DataSourceUtils.getConnection(solutionDbDatasource)` finds no `TransactionSynchronizationManager` binding for this object → returns a fresh auto-commit connection. Thread B's JDBC SELECT, once it acquires the lock, correctly sees Thread A's committed INSERT. Race B does NOT occur.  
+
+T-10 fix (already applied): `writeNonOrgSummariesAtomically()` uses `rewardIssueSummaryJdbcRepository.findExistingForNonOrgLevel()` (JDBC) rather than JPA — correct and future-safe regardless of DataSource wiring, but NOT the cause of the T3/T4 test failure.  
+
+Fix required: **T-19** — introduce `redis.reward.lock.maxWaitTime` property (default 5000 ms) distinct from the existing 10 ms customer-lock timeout. `NonOrgSummaryWriteProcessor` uses this longer timeout when acquiring the per-reward lock. 10 ms is appropriate for same-customer serialisation; 5000 ms is needed for cross-customer reward-level serialisation where N threads queue sequentially.
+
+**✅ Resolution (T-19 implemented):**
+
+The two timeouts serve fundamentally different semantics — which is why they must be separate properties:
+
+| | Customer lock (`redis.lock.maxWaitTime=10ms`) | Reward lock (`redis.reward.lock.maxWaitTime=5000ms`) |
+|---|---|---|
+| **Key** | `{orgId}_{customerId}` | `reward_constraint:{orgId}:{rewardId}` |
+| **Scope** | Per-customer (one key per customer) | Per-reward shared across all customers |
+| **Threads contending** | Same customer hitting concurrently (rare; most apps retry) | Different customers, all legitimate concurrent requests |
+| **Desired behaviour on timeout** | Fail fast — same customer retry is cheap | Queue — legitimate concurrent requests must not be rejected |
+
+Raising `redis.lock.maxWaitTime` (the shared property) to 5000 ms would cause same-customer lock contention to hold threads open for 5 seconds instead of failing fast — unacceptable latency under pathological same-customer concurrency. The separate property keeps each lock at the right operating point.
+
+Changes delivered:
+- `redis.reward.lock.maxWaitTime=${REDIS_REWARD_LOCK_MAX_WAIT_TIME:5000}` added to both `src/main/resources/application.properties` (line 40) and `src/test/resources/application.properties` (line 41)
+- `RewardsApplicationConfiguration.getRedisRewardLockAcquireMaxWaitTime()` — new `@Value`-bound getter
+- `RedisLockService.acquireRewardLock(key)` — new method using `redisLockRegistry` + `redisRewardLockAcquireMaxWaitTime`; all other lock methods unchanged
+- `NonOrgSummaryWriteProcessor.processWrapper()` — `acquireLock(lockKey)` → `acquireRewardLock(lockKey)`
+- `RewardConstraintConcurrencyIntegrationTest` `@TestPropertySource` — replaced `redis.lock.maxWaitTime=5000` (wrong property, was overriding customer lock) with `redis.reward.lock.maxWaitTime=5000` (correct property for reward lock)
 
 **GAP [SEVERITY: HIGH] — `writeNonOrgSummariesAtomically()` double-increments when multiple FIXED-window constraints share the same `(Level, KPI)` row**  
 Category: Implementation regression introduced by CAPJUN19  
@@ -92,6 +116,42 @@ Root cause: `isEquivalentToConstraint()` ([RewardConstraint.java:144](src/main/j
 The old `buildUniqueSummaries()` path was immune because it used a `Set` of object references — both constraints resolved to the same object in the Set, so the consumed was set only once in the final loop.  
 Validated against: a brand configuring `REWARD-level QUANTITY FIXED/DAYS limit=5` + `REWARD-level QUANTITY FIXED/MONTHS limit=30` is allowed by `RewardConstraintValidation` (distinct constraint keys `QUANTITY_DAYS_FIXED` ≠ `QUANTITY_MONTHS_FIXED`). This is a realistic production combination (daily cap + monthly cap on same reward).  
 Fix (deduplication before flush): deduplicate `toAtomicIncrement` by row ID (first match wins — delta is the same KPI quantity for all constraints sharing the row); deduplicate `toInsert` by `(level, kpi, userId, issueDate)` surrogate key before calling `save()`. See T-18.
+
+**✅ Resolution (T-18 implemented):**
+
+**Why `Map.putIfAbsent` with typed keys, not "check `toInsert` during the loop":**
+
+The user raised the question: "should we look up `toInsert` along with `existingRows` when searching for a match?" — mirroring the old `buildUniqueSummaries()` accumulating-Set approach. Both strategies are semantically equivalent in outcome, but they differ in correctness risk:
+
+*Old approach (accumulating Set):* `stream().filter(isEquivalentToConstraint).findFirst()` checked both DB rows AND previously created rows in the same collection. This worked despite `RewardIssueSummary` having no `@EqualsAndHashCode` (only identity equality) because the lookup used a custom predicate — `Set.contains()` was never called. The `HashSet<RewardIssueSummary>` was effectively a mutable list.
+
+*T-18 approach (typed Map keys):* Deduplication happens at the accumulation step, not the lookup step. The Map keys are `Long` (rowId) and `String` (level|kpi|issueDate surrogate) — both JDK types with correct `equals()`/`hashCode()`. `RewardIssueSummary.equals()` is never called. `putIfAbsent` keeps the first match and silently drops duplicates.
+
+**Why "look up `toInsert` in the loop" would be more complex:** Rows in `toInsert` have no database ID yet (pre-INSERT). If C2 found C1's staged row there, the only valid action is to skip C2 — you cannot add C2 to `toAtomicIncrement` (no ID). `putIfAbsent` achieves exactly that skip, at the accumulation step, without the loop-level lookup. Same outcome, simpler code.
+
+**Why dropping C2's delta is correct:** C1 and C2 at the same `(level, kpi)` share the same logical consumed counter. The delta is derived from `quantity`/`points`/`redemptionValue` — identical for both, because they represent the same issuance event, not two independent events. One issuance = one increment on the shared counter, regardless of how many constraints map to that counter.
+
+**`RewardIssueSummary.equals()` investigation:** Confirmed by reading [`RewardIssueSummary.java`](src/main/java/com/capillary/solutions/rewards/db/RewardIssueSummary.java) — annotations are `@Getter @Setter @Builder @Entity`. No `@EqualsAndHashCode`, no `@Data`. Default identity equality only. This does NOT affect the T-18 fix (values in the Map, not keys). It also did not affect the old code (Set backed by stream filter, not `contains()`). Documenting to prevent future developers from introducing a `Set<RewardIssueSummary>` dedup assuming structural equality would work.
+
+Changes delivered ([RewardConstraintFacade.java:432–478](src/main/java/com/capillary/solutions/rewards/service/impl/RewardConstraintFacade.java)):
+- `List<RewardIssueSummary> toAtomicIncrement` → `Map<Long, RewardIssueSummary>` keyed by `existing.getId()`; `putIfAbsent(existing.getId(), deltaEntry)` — second FIXED constraint finding same row is dropped
+- `List<RewardIssueSummary> toInsert` → `Map<String, RewardIssueSummary>` keyed by `constraint.getConstraintLevel() + "|" + constraint.getKpi() + "|" + expectedDate.getTime()`; `putIfAbsent(key, newRow)` — second INSERT for same logical row is dropped
+- Flush changed from `for newRow : toInsert` → `for newRow : toInsert.values()`; `bulkAtomicIncrement(toAtomicIncrement)` → `bulkAtomicIncrement(new ArrayList<>(toAtomicIncrement.values()))`
+- Integration tests T7 (REWARD-level dual-FIXED concurrent, asserts 1 row consumed=3 not 6) and T8 (dual-FIXED at both REWARD + CUSTOMER level, asserts 1 row each consumed=3) added to `RewardConstraintConcurrencyIntegrationTest`
+
+**GAP [SEVERITY: LOW] — `RewardConstraint.equals()`/`hashCode()` contract violation (pre-existing)**  
+Category: Domain model design smell  
+Finding: `RewardConstraint` ([RewardConstraint.java:27](src/main/java/com/capillary/solutions/rewards/db/RewardConstraint.java)) declares `@EqualsAndHashCode(of = {"id"})` at the class level, but also defines a manual `equals()` at lines 99–110 (business fields: `orgId, kpi, constraintLevel, repeatFrequencyType, limitValue, windowType`) and a manual `hashCode()` at lines 112–115 (`Objects.hash(id, orgId)`). Lombok skips generating `equals()` when a manual one exists — so the annotation is dead letter. The resulting contract is broken: two objects that are `equals()` by business fields can have different `hashCode()` (different `id`), violating the Java spec. Additionally, `rewardId` is absent from `equals()`, meaning constraints for different rewards with identical business fields are considered equal — a latent cross-reward collision if ever used outside single-reward context.  
+Why safe now: `getIndependentRewardCustomerNoLimitRestrictions()` builds its `Set<RewardConstraint>` from the same object references that the loop checks with `contains()`. Same reference → same `id` → same `hashCode()` → correct bucket lookup. Safe as long as constraints are never reconstructed from separate queries or deserialized.  
+This is a pre-existing bug; CAPJUN19 did not introduce it. However, the T-18 fix adds another `independentNoLimitConstraints.contains(constraint)` call path, making the risk worth documenting.  
+No action required for Phase 1 — the existing usage pattern is safe. Note for future: if `RewardConstraint` equality is ever needed in a cross-reward context, fix the contract by including `rewardId` in `equals()` and aligning `hashCode()` with the same fields.
+
+**GAP [SEVERITY: NOTE] — Compensation leaves zero-consumed rows (design decision)**  
+Category: Data lifecycle design  
+Finding: `bulkAtomicDecrement` SQL is `CONSUMED = CONSUMED - :delta`. For a newly inserted row (consumed=delta from INSERT), compensation brings consumed to 0. No DELETE path exists. The row stays with consumed=0.  
+Why this is correct: consumed=0 < limitValue → future limit checks still pass. The next issuance finds the existing row and increments it — no second INSERT race. Semantically clean.  
+Risk: On high-volume rewards with frequent downstream failures (coupon service flapping), zero-consumed rows accumulate indefinitely. No functional impact on correctness. Data hygiene concern only — monitoring `CONSUMED=0` rows over time can signal downstream failure rate spikes.  
+Design decision confirmed: decrement (not delete) is intentional. DELETE would require additional coordination to avoid racing against concurrent reads inside the lock.
 
 **GAP [SEVERITY: LOW] — `pos13HandledConstraintIds` naming leaks positional implementation detail**  
 Category: Domain vocabulary  
@@ -114,9 +174,9 @@ MADRs from `.context/overview.md`:
 
 | Guardrail | Status | Finding |
 |-----------|--------|---------|
-| Redis Distributed Lock — use `RedisLockService` / `CustomerLockManager`, do not create bare `ReentrantLock` | PASS | `NonOrgSummaryWriteProcessor` uses `redisLockService.acquireLock()` |
-| Redis Distributed Lock — always release in `finally` | PASS | `releaseLock(lock)` in finally at NonOrgSummaryWriteProcessor.java:130 |
-| Redis Distributed Lock — lock TTL and max-wait-time are configured via properties | PASS | Uses configured `redis.lock.ttl` and `redisLockAcquireMaxWaitTime` from `rewardsApplicationConfiguration` |
+| Redis Distributed Lock — use `RedisLockService` / `CustomerLockManager`, do not create bare `ReentrantLock` | PASS | `NonOrgSummaryWriteProcessor` uses `redisLockService.acquireRewardLock()` (T-19); customer lock still via `CustomerLockManager` |
+| Redis Distributed Lock — always release in `finally` | PASS | `releaseLock(lock)` in finally at NonOrgSummaryWriteProcessor.java:131 |
+| Redis Distributed Lock — lock TTL and max-wait-time are configured via properties | PASS | Reward lock: `redis.lock.ttl` (TTL) + `redis.reward.lock.maxWaitTime` (acquire wait, T-19). Customer lock: `redis.lock.ttl` + `redis.lock.maxWaitTime`. Both from `RewardsApplicationConfiguration`. |
 | Processor Chain — keep processors single-purpose | PASS | `NonOrgSummaryWriteProcessor` has one responsibility: atomic write of non-org summaries |
 | Processor Chain — carry all request-scoped state in context object | PASS | `writtenSummaryRows` and `atomicWrittenConstraintIds` carried in `BulkRewardIssueContext` |
 | JDBC — correct parameter source for batch updates | PASS | `HashMap<String, Object>` arrays passed to `jdbc().batchUpdate()` |
@@ -221,7 +281,8 @@ Responsibility: Authoritative enforcement of REWARD- and CUSTOMER-level constrai
                 Acquires per-reward lock (REWARD only), re-evaluates, writes atomically.
 
 + process(ctx: BulkRewardIssueContext): BulkRewardIssueContext
-    → redisLockService.acquireLock("reward_constraint:{orgId}:{rewardId}")  [conditional]
+    → redisLockService.acquireRewardLock("reward_constraint:{orgId}:{rewardId}")  [conditional — T-19]
+        uses: redisRewardLockAcquireMaxWaitTime (5000 ms default, NOT the 10 ms customer-lock timeout)
     → reEvaluateConstraints(): boolean    [refreshSummary inside lock for REWARD-level]
     → rewardConstraintFacade.writeNonOrgSummariesAtomically()
     → ctx.recordWrittenSummaryRows(rewardId, written)
@@ -242,14 +303,20 @@ Responsibility: Atomic write for non-org summary rows.
     → rewardIssueSummaryJdbcRepository.findExistingForNonOrgLevel()  [JDBC — bypasses JPA REPEATABLE_READ snapshot; inside caller's lock]
     → for each constraint (skipping dependent NO_LIMIT):
         → find existing row by (level, kpi, userId, issueDate) match
-        → if existing: add to toAtomicIncrement map keyed by row ID (Map.putIfAbsent — first FIXED-window wins; prevents double-increment for FIXED/DAYS + FIXED/MONTHS at same level+kpi)
-        → if not existing: add to toInsert map keyed by (level+kpi+userId+issueDate) (Map.putIfAbsent — prevents duplicate INSERT for same physical row)
-    → rewardIssueSummaryJdbcRepository.save(newRow) for each unique insert  [INSERT — returns ID for compensation]
-    → rewardIssueSummaryJdbcRepository.bulkAtomicIncrement(deltas)  [CONSUMED = CONSUMED + delta — deduplicated list, one entry per unique row ID]
+        → if existing: toAtomicIncrement.putIfAbsent(existing.getId(), deltaEntry)
+                    Key = Long(rowId) — Long.equals() is correct; RewardIssueSummary.equals() never called
+                    First FIXED-window constraint wins; FIXED/DAYS + FIXED/MONTHS at same (level,kpi) deduplicated to one increment
+        → if not existing: insertKey = level+"|"+kpi+"|"+issueDate.getTime()
+                    toInsert.putIfAbsent(insertKey, newRow)
+                    Key = String — String.equals() is correct; second constraint for same logical row dropped silently
+    → for newRow in toInsert.values(): rewardIssueSummaryJdbcRepository.save(newRow)  [INSERT — returns ID for compensation]
+    → rewardIssueSummaryJdbcRepository.bulkAtomicIncrement(new ArrayList<>(toAtomicIncrement.values()))
+                    [CONSUMED = CONSUMED + delta — one entry per unique row ID, no double-increment]
     Returns: entries with consumed = delta (for compensation — caller stores these)
-    Guardrail check: PASS after T-18 fix
+    Guardrail check: PASS
     Bug pre-T-18: toAtomicIncrement was a List; two FIXED-window constraints at same (level, kpi) produced two entries for the same row ID → CONSUMED += delta twice.
-                  toInsert was a List; same scenario on first issuance produced two save() calls → duplicate rows.
+                  toInsert was a List; same scenario on first issuance produced two save() calls → duplicate rows with identical (level, kpi, userId, issueDate).
+    Note: RewardIssueSummary has no @EqualsAndHashCode (identity equality only). The Map key approach is correct precisely because it uses String/Long keys — NOT RewardIssueSummary equality. Any future use of Set<RewardIssueSummary> for structural dedup would silently fail.
 ```
 
 **`RewardConstraintFacade.updateSummaries()`** — [RewardConstraintFacade.java:330](src/main/java/com/capillary/solutions/rewards/service/impl/RewardConstraintFacade.java)
@@ -418,7 +485,7 @@ Error responses for constraint violations continue to use `CONSTRAINT_EVALUATION
 | Type | Change |
 |------|--------|
 | New class | `NonOrgSummaryWriteProcessor` — implements `IssueRewardProcessor`, inserted at chain position 13 |
-| New pattern | Per-reward Redis distributed lock for REWARD-level constraint serialization (distinct from customer lock) |
+| New pattern | Per-reward Redis distributed lock for REWARD-level constraint serialization (distinct from customer lock); acquired via `acquireRewardLock()` using `redis.reward.lock.maxWaitTime` (5000 ms) — separate from the 10 ms `redis.lock.maxWaitTime` customer-lock timeout |
 | New pattern | Atomic SQL increment/decrement (`CONSUMED = CONSUMED + :delta`) for race-safe summary writes |
 | New pattern | Two-phase write responsibility: pos-13 writes REWARD+CUSTOMER-level (inside lock, regardless of WindowType — FIXED and ROLLING handled identically via `issualDate` resolution); `updateSummaries()` writes ORG-level only |
 | New pattern | CQ9 filter in `updateSummaries()` — context carries `writtenSummaryRows` and `pos13HandledConstraintIds` to prevent double-write |
@@ -488,7 +555,7 @@ No upstream change. The `issueReward` API contract is unchanged.
 2. **Deploy:** Standard rolling deploy — no feature flag needed (processor chain is always active; new processor is conditional on REWARD-level constraint presence).
 3. **Staging validation (required):** Run 50 concurrent `issueReward` calls for a reward with REWARD-level limit=10; confirm exactly 10 succeed and 40 get `CONSTRAINT_EVALUATION_FAILED`. Confirm exactly 1 `TBL_REWARD_ISSUE_SUMMARY` REWARD-level row exists with `consumed = 10`.
 4. **Go/no-go criteria:**
-   - Integration tests T1–T6 all pass (T2/T3/T4 fix required before deploy — see §21 T-10)
+   - Integration tests T1–T8 all pass ✅ (T2/T3/T4 fixed by T-19; T7/T8 verify T-18 dedup fix)
    - Staging validation confirms limit enforcement
    - `P99 of NonOrgSummaryWriteProcessor.process()` < 100ms under load
 5. **Rollback:** Revert to prior commit. CONSUMED values written atomically will be correct; no corrupted state to clean up. Lock TTL expiry is automatic — Redis cleans up within configured TTL.
@@ -500,14 +567,17 @@ No upstream change. The `issueReward` API contract is unchanged.
 
 | # | Description | Likelihood | Mitigation |
 |---|------------|-----------|-----------|
-| 1 | T2/T3/T4 integration tests not fixed before deploy — lock contention path returns wrong response code at reward level | Medium | Investigate `BulkIssueService.buildResponse()` for unprocessed-wrapper code path; fix before deploy (§21 T-10) |
-| 2 | `redisLockAcquireMaxWaitTime` too short — concurrent threads for same reward time out; all-but-first fail with lock contention instead of serializing | Medium | Measure current value; set ≥ nominal lock hold time × expected concurrent depth (recommend ≥ 500ms) |
+| 1 | ~~T2/T3/T4 integration tests not fixed before deploy~~ | ~~Medium~~ | ✅ **Closed** — T4 root cause is 10 ms lock timeout, not JPA REPEATABLE_READ (T-10 was valid JDBC cleanup but not the cause). T-19 adds separate reward-lock wait time (5000 ms). T-10 ✅ Done. |
+| 2 | **Reward-level lock timeout too short for production** — `redis.lock.maxWaitTime=10ms` (default) causes threads B–N to time out immediately when Thread A holds the reward lock for its full DB processing time (~10–100 ms in prod). All-but-first concurrent requests fail with `CONSTRAINT_EVALUATION_FAILED` on popular rewards. | **High** | ✅ **Root cause confirmed.** T-19 adds `redis.reward.lock.maxWaitTime` (default 5000 ms) used exclusively in `NonOrgSummaryWriteProcessor`. Existing 10 ms customer-lock timeout unchanged. |
+| 9 | **Lock timeout misconfigured in tests (`REDIS_LOCK_MAX_WAIT_TIME=10ms`)** — confirmed root cause of T3/T4 failures. All threads except Thread A time out. Fixed by T-19 property separation. | High (tests) | T-19: test properties get `redis.reward.lock.maxWaitTime=5000`; prod gets env-var default 5000 ms |
 | 3 | Compensation path not triggered on all failure paths — partial bulk failures leave CONSUMED over-decremented | Low | try-finally in `UserRewardUtils` always fires; compensation is wrapped in try/catch internally |
 | 4 | ORG-level constraints still exposed to Race A and Race C under Phase 1 | Medium (known, accepted; lower severity than REWARD-level) | Deferred to Phase 2; requires `acquireBulkLock()` strategy distinct from the per-reward lock |
 | 5 | `pos13HandledConstraintIds` naming — ~~resolved~~ | — | Renamed to `atomicWrittenConstraintIds` throughout (T-8 ✅ Done) |
 | 6 | ~~Production DDL for `TBL_REWARD_ISSUE_SUMMARY` missing `ON UPDATE CURRENT_TIMESTAMP`~~ | ~~Low~~ | ✅ **Closed** — DBA confirmed production DDL has `ON UPDATE CURRENT_TIMESTAMP` on `LAST_UPDATED_ON`. |
 | 7 | Lock key `reward_constraint:` prefix collides with future key usage | Low | Document in code; adopt convention of prefix registry for all Redis keys |
-| 8 | **Multi-FIXED-window double-increment regression** — brands configuring FIXED/DAYS + FIXED/MONTHS at same (REWARD or CUSTOMER, KPI) level would have CONSUMED incremented twice per issuance (and duplicate rows on first issuance) | **High** — valid production configuration, blocked by T-18 fix before deploy | Apply deduplication fix in `writeNonOrgSummariesAtomically()` (T-18); covered by IT-T19/IT-T21 |
+| 10 | **`RewardConstraint.equals()`/`hashCode()` contract violated (pre-existing)** — `@EqualsAndHashCode(of = {"id"})` annotation is dead (manual equals() overrides it); manual equals() uses business fields while hashCode() uses id+orgId; `rewardId` absent from equals(). Current usage (`contains()` on same object references) is safe. Risk: latent cross-reward collision if constraints are ever compared across rewards or deserialized. | Low (pre-existing) | No Phase 1 action. Future fix if cross-reward equality ever needed: include `rewardId` in equals() and align hashCode() with same fields. |
+| 11 | **Zero-consumed rows after compensation** — decrement (not delete) leaves rows with consumed=0 in `TBL_REWARD_ISSUE_SUMMARY`. Functionally correct; no limit-check impact. Accumulation rate = downstream failure rate. | Low (design decision) | Monitor `SELECT COUNT(*) FROM TBL_REWARD_ISSUE_SUMMARY WHERE CONSUMED=0` as downstream failure rate signal. No cleanup required unless volume becomes operationally significant. |
+| 8 | ~~**Multi-FIXED-window double-increment regression**~~ | ~~High~~ | ✅ **Closed** — T-18 applied `Map.putIfAbsent` dedup keyed by `Long(rowId)` for increments and `String(level\|kpi\|issueDate)` for inserts. `RewardIssueSummary.equals()` is NOT used (identity equality only; Map keys are JDK types). Integration tests T7 and T8 confirm 1 row per level, consumed=N not 2N. |
 
 ---
 
@@ -518,7 +588,7 @@ No upstream change. The `issueReward` API contract is unchanged.
 | What percentage of active reward constraints are ORG-level (`rewardId = -1L`)? Determines Phase 2 urgency. ROLLING window is covered by Phase 1 — this question is about ORG-level scope only. | Data team | Before Phase 2 planning | ✅ **Answered:** Not many brands are using ORG-level constraints yet. Phase 2 urgency is LOW — can be deferred without immediate production risk. |
 | What is the current `redis.lock.ttl` value for the `redisLockRegistry` (customer lock registry) in production? Is it ≥ 500ms? | DevOps | Before deploy | ⬜ Open |
 | Does production `TBL_REWARD_ISSUE_SUMMARY` DDL have `ON UPDATE CURRENT_TIMESTAMP` on `LAST_UPDATED_ON`? | DBA | Before deploy | ✅ **Answered:** Yes — production DDL has `ON UPDATE CURRENT_TIMESTAMP`. Databricks ETL delta pickup via `LAST_UPDATED_ON` is confirmed safe. Risk #6 closed. |
-| **T4 fix verification**: Does `solutionDbDatasource` participate in the outer Spring transaction (i.e., does `DataSourceUtils.getConnection(solutionDbDatasource)` return the transaction-bound connection)? If yes, the JDBC SELECT in `findExistingForNonOrgLevel()` still sees the outer transaction snapshot. Resolution options: confirm auto-commit behavior, or enforce isolation via MySQL upsert (`INSERT ... ON DUPLICATE KEY UPDATE` with a unique index). | Implementer | Immediately (blocks T4 fix) | ⬜ Open |
+| **T4 fix verification**: Does `solutionDbDatasource` participate in the outer Spring transaction (i.e., does `DataSourceUtils.getConnection(solutionDbDatasource)` return the transaction-bound connection)? If yes, the JDBC SELECT in `findExistingForNonOrgLevel()` still sees the outer transaction snapshot. | Implementer | Immediately (blocks T4 fix) | ✅ **Answered** — `solutionDbDatasource` (`SimpleTestDataSourceManager` → `BaseIntegrationTest.dataSource`) and Spring's auto-configured JPA DataSource are **separate `HikariDataSource` objects**. `DataSourceUtils.getConnection(solutionDbDatasource)` finds no `TransactionSynchronizationManager` binding → returns a fresh auto-commit connection. Thread B's JDBC SELECT, once inside the lock, correctly sees Thread A's committed INSERT. Race B does NOT occur via JPA REPEATABLE_READ snapshot. T4 was failing due to 10ms lock timeout (T-19), not DataSource isolation. |
 
 ---
 
@@ -554,15 +624,16 @@ Q2: Is the `redisLockRegistry` (used by `acquireLock(String key)`) on the same R
 | T-7 | Add `compensateFailedSummaryWrites()` delegation in `UserRewardFacade` | S | T-3 | ✅ Done |
 | T-8 | Rename `pos13HandledConstraintIds` → `atomicWrittenConstraintIds` throughout | S | — | ✅ Done |
 | T-9 | Fix stale "pos-12" references in comments → "RewardConstraintProcessor" | S | — | ✅ Done |
-| T-10 | **T4 fix — JDBC SELECT bypasses JPA REPEATABLE_READ snapshot.** Root cause confirmed: `getExistingRewardIssueSummariesForNonOrgLevel()` (JPA) uses the EntityManager's REPEATABLE_READ snapshot, which predates concurrent threads' auto-committed INSERTs. Fix: replaced with `rewardIssueSummaryJdbcRepository.findExistingForNonOrgLevel()` (JDBC SELECT) which reads committed data directly. Integration test T4 validation in progress. | M | — | 🔄 In Progress |
-| T-18 | **Multi-FIXED-window deduplication fix in `writeNonOrgSummariesAtomically()`.** Replace `toAtomicIncrement: List` with `Map<Long, RewardIssueSummary>` keyed by row ID (`putIfAbsent` — first match wins). Replace `toInsert: List` with `Map<String, RewardIssueSummary>` keyed by `level+kpi+userId+issueDate` (`putIfAbsent`). Flush using `map.values()`. Prevents double-increment and duplicate INSERT for FIXED/DAYS + FIXED/MONTHS at same (Level, KPI). See §5a GAP HIGH and Risk #8. Implement and test via `/tdd-developer`. | S | T-3 | ⬜ Pending |
+| T-10 | **JDBC SELECT in `writeNonOrgSummariesAtomically()`.** Replaced JPA read with `rewardIssueSummaryJdbcRepository.findExistingForNonOrgLevel()` — correct and future-safe (reads committed data, not JPA snapshot). Investigation confirmed this is NOT the root cause of T3/T4 failure; the actual cause is the 10 ms lock timeout (T-19). | M | — | ✅ Done |
+| T-18 | **Multi-FIXED-window deduplication fix in `writeNonOrgSummariesAtomically()`.** `toAtomicIncrement: List` → `Map<Long, RewardIssueSummary>` keyed by `existing.getId()` (`putIfAbsent`). `toInsert: List` → `Map<String, RewardIssueSummary>` keyed by `level+"\|"+kpi+"\|"+issueDate.getTime()` (`putIfAbsent`). Flush via `.values()`. Decision rationale: typed String/Long keys give correct `equals()` without requiring `RewardIssueSummary.equals()` (which is identity-only — no `@EqualsAndHashCode`). Tests T7 + T8 added. See §5a GAP HIGH Resolution. | S | T-3 | ✅ Done |
+| T-19 | **Separate reward-lock acquire timeout property.** `redis.reward.lock.maxWaitTime=${REDIS_REWARD_LOCK_MAX_WAIT_TIME:5000}` added to both property files. `RewardsApplicationConfiguration.getRedisRewardLockAcquireMaxWaitTime()` added. `RedisLockService.acquireRewardLock(key)` added using `redisLockRegistry` + new wait time. `NonOrgSummaryWriteProcessor` → `acquireRewardLock(lockKey)`. Customer-level `acquireLock(key)` (10 ms) unchanged. `@TestPropertySource` corrected: `redis.lock.maxWaitTime=5000` was overriding the customer lock (wrong), replaced with `redis.reward.lock.maxWaitTime=5000`. Decision rationale: customer lock must fail-fast (10 ms) while reward lock must queue (5000 ms) — two semantics, two properties. See §5a GAP HIGH Resolution. | S | T-4 | ✅ Done |
 
 ### Testing
 
 | # | Description | Size | Dependencies | Status |
 |---|------------|------|--------------|--------|
-| T-11 | Create `RewardConstraintConcurrencyIntegrationTest` (T1–T6) | M | T-4, T-5 | ✅ Done (T1, T5, T6 pass; T4 under fix via T-10) |
-| T-12 | Complete T2/T3/T4 integration test validation after T-10 fix | M | T-10 | 🔄 In Progress |
+| T-11 | Create `RewardConstraintConcurrencyIntegrationTest` (T1–T6) | M | T-4, T-5 | ✅ Done |
+| T-12 | T2/T3/T4 validation — T2 (limit=1, 2 customers, exactly 1 passes), T3 (limit=5, 2 customers, no duplicate row), T4 (limit=10, 5 customers, consumed=5 exact). Root cause of T3/T4 failure was 10 ms lock timeout (T-19). T7 (dual-FIXED REWARD-level dedup) and T8 (dual-FIXED both levels) added for T-18 coverage. | M | T-18, T-19 | ✅ Done (T1–T8 all pass) |
 | T-13 | Add compensation integration test: simulate downstream failure after write; assert CONSUMED decremented | M | T-6 | ⬜ Pending |
 
 ### Observability
