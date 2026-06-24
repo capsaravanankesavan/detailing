@@ -1252,3 +1252,163 @@ Suggested test coverage emphasis:
 - Integration (concurrency): see **`## Integration Test Plan`** section above — 7 tests in `RewardConstraintConcurrencyIntegrationTest` cover all three races across QUANTITY/POINTS KPIs and FIXED/ROLLING windows. T1–T3 fail pre-fix at the API level. T4–T5 fail only at the DB level (API returns 200) — these are the critical hidden-corruption cases.
 - Integration (compensation): simulate `CouponIssueProcessor` failure after pos 13; assert `CONSUMED` is decremented back to pre-request value
 - Integration (`lastUpdatedOn`): assert Databricks-visible column updated after atomic increment
+
+---
+
+## Gap 3: Partial Issuance Compensation — Two Coupled Bugs
+
+**Identified:** 2026-06-24 (tech lead review of `compensateFailedSummaryWrites`)  
+**Severity:** HIGH — CONSUMED is systematically over-counted for every partial-success vendor issuance
+
+---
+
+### Context
+
+`writeNonOrgSummariesAtomically()` ([RewardConstraintFacade.java:403–485](src/main/java/com/capillary/solutions/rewards/service/impl/RewardConstraintFacade.java)) writes `delta = resolveAtomicDelta(kpi, quantityToBeProcessed, ...)` before the vendor outcome is known — correct by design (atomic constraint check + write under Redis lock). `compensateFailedSummaryWrites()` (lines 512–526) is responsible for unwinding this pre-write for any quantity that vendor issuance subsequently failed.
+
+`VendorIssueProcessor` makes one vendor API call per qty unit in a concurrent executor loop (lines 131–133). `successCount` is incremented per successful call (line 169). For `quantityToBeProcessed=2` with 1 success + 1 failure this creates a partial-success scenario that both bugs mishandle.
+
+---
+
+### Bug A — Incorrect filter: `!w.isAnySuccessful()` misses partial failures
+
+**Location:** `RewardConstraintFacade.java:516`
+
+```java
+.filter(w -> !w.isAnySuccessful())  // BUG: only fires when successCount == 0
+```
+
+`isAnySuccessful()` at `BulkRewardIssueContext.java:482–484`:
+
+```java
+public boolean isAnySuccessful() {
+    return successCount > 0;
+}
+```
+
+For qty=2, successCount=1: `isAnySuccessful()` = `true` → `!isAnySuccessful()` = `false` → wrapper excluded from forEach. The 1 failed qty's pre-written `CONSUMED` delta is **never decremented**.
+
+**Impact:** Every partial-success vendor issuance scenario permanently over-counts CONSUMED. Limit exhaustion occurs earlier than configured.
+
+---
+
+### Bug B — Incorrect delta: full qty used instead of failed qty
+
+**Location:** `RewardConstraintFacade.java:521` — `rewardIssueSummaryJdbcRepository.bulkAtomicDecrement(rows)`
+
+`bulkAtomicDecrement` uses `d.getConsumed()` as the delta (`RewardIssueSummaryJdbcRepository.java:196`). The `consumed` field on each row was set to the original full-qty delta by `writeNonOrgSummariesAtomically()`. Even if Bug A were fixed, the decrement for a partial failure (failedQty=1 of totalQty=2) would still use delta=2 (full) — over-decrement by 1.
+
+---
+
+### Decision: `getFailedQuantity()` as the reliable failure measure
+
+**Why `failureCount` cannot be used:**
+
+`VendorIssueProcessor.java:163` — inside `catch(Exception e)` after `getVendorRewardDetails()` throws (a wrapper-level exception covering all qty units):
+
+```java
+rewardIssueWrapper.setFailureCount(rewardIssueWrapper.getFailureCount() + 1);  // BUG: should be +quantityToBeProcessed
+```
+
+This increments `failureCount` by 1 regardless of how many qty units were in-flight. Breaks the invariant `successCount + failureCount == quantityToBeProcessed` for this path. See T-21 for the standalone fix.
+
+**Proposed `getFailedQuantity()`** — add to `BulkRewardIssueContext.RewardIssueWrapper`:
+
+```java
+public int getFailedQuantity() {
+    return quantityToBeProcessed - successCount;
+}
+```
+
+`successCount` is always reliable:
+- Per successful vendor response: `VendorIssueProcessor.java:169` — `+1` per response
+- No-vendor path: `VendorIssueProcessor.java:92` — set to `quantityToBeProcessed` (all success)
+- InterruptedException path: `VendorIssueProcessor.java:145` — `failureCount` set to `quantityToBeProcessed` (all fail; `successCount` stays 0)
+
+`quantityToBeProcessed - successCount` correctly captures both total failure (`successCount=0`) and partial failure (`0 < successCount < quantityToBeProcessed`).
+
+---
+
+### Decision: POINTS KPI is not applicable at non-org level
+
+`RewardConstraintValidation.java:68–69` rejects any `POINTS_KPI` constraint at non-org levels with `POINTS_KPI_NOT_SUPPORTED`. POINTS constraints cannot exist in `writtenSummaryRows` for non-org constraints. The multiply/divide POINTS branch in any prior compensation formula was dead code. The fix does not include a `POINTS` case.
+
+---
+
+### Decision: TRANSACTION_COUNT special case for partial issuance
+
+`TRANSACTION_COUNT` KPI is also rejected at `REWARD`/`CUSTOMER` levels by `RewardConstraintValidation.java:71–72`. For completeness in the fix:
+
+- Partial success (some qty issued): the transaction DID happen — do **not** decrement TRANSACTION_COUNT.
+- Total failure (`failedQty == totalQty`): no transaction — decrement TRANSACTION_COUNT by 1.
+
+---
+
+### Fix Design (T-20)
+
+**`BulkRewardIssueContext.RewardIssueWrapper` — add method:**
+
+```java
+public int getFailedQuantity() {
+    return quantityToBeProcessed - successCount;
+}
+```
+
+**`RewardConstraintFacade.compensateFailedSummaryWrites()` — replace body:**
+
+```java
+ctx.streamAllRewardIssueWrapper()
+    .filter(w -> w.getFailedQuantity() > 0)       // catches partial AND total failure
+    .forEach(w -> {
+        int failedQty = w.getFailedQuantity();
+        int totalQty  = w.getQuantityToBeProcessed();
+        List<RewardIssueSummary> rows = ctx.getWrittenSummaryRowsForCompensation(w.getReward().getId());
+        if (!CollectionUtils.isEmpty(rows)) {
+            List<RewardIssueSummary> compensationRows = rows.stream()
+                .map(row -> {
+                    BigDecimal compensationDelta;
+                    switch (row.getKpi()) {
+                        case QUANTITY:
+                            compensationDelta = BigDecimal.valueOf(failedQty);
+                            break;
+                        case REDEMPTION_VALUE:
+                            compensationDelta = w.getRedemptionValue().multiply(BigDecimal.valueOf(failedQty));
+                            break;
+                        case TRANSACTION_COUNT:
+                            compensationDelta = (failedQty == totalQty) ? BigDecimal.ONE : BigDecimal.ZERO;
+                            break;
+                        default:
+                            return null;  // POINTS not valid at non-org level
+                    }
+                    if (compensationDelta.compareTo(BigDecimal.ZERO) == 0) return null;
+                    return RewardIssueSummary.builder()
+                        .id(row.getId()).orgId(row.getOrgId()).consumed(compensationDelta).build();
+                })
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+            if (!compensationRows.isEmpty()) {
+                log.warn("Compensating {} summary row(s) for rewardId={} (failed={} of {})",
+                    compensationRows.size(), w.getReward().getId(), failedQty, totalQty);
+                rewardIssueSummaryJdbcRepository.bulkAtomicDecrement(compensationRows);
+            }
+        }
+    });
+```
+
+---
+
+### Pre-existing Bug: `VendorIssueProcessor.java:163` — `failureCount += 1` for wrapper-level exception (T-21)
+
+```java
+// catch (Exception e) after getVendorRewardDetails() throws — all qty units affected
+rewardIssueWrapper.setFailureCount(rewardIssueWrapper.getFailureCount() + 1);
+// should be: + rewardIssueWrapper.getQuantityToBeProcessed()
+```
+
+**Fix:**
+
+```java
+rewardIssueWrapper.setFailureCount(rewardIssueWrapper.getFailureCount() + rewardIssueWrapper.getQuantityToBeProcessed());
+```
+
+T-20 is immune to this bug (uses `getFailedQuantity()` = `quantityToBeProcessed - successCount`). T-21 is a standalone fix to restore the `failureCount` invariant for any future consumers of the field.

@@ -164,6 +164,27 @@ Category: Code hygiene
 Line 136: comment says `"CQ4: no refreshSummary() here — pos-12's read is authoritative"` — "pos-12" should be "RewardConstraintProcessor".  
 Required correction: Replace positional reference with class name.
 
+**GAP [SEVERITY: HIGH] — `compensateFailedSummaryWrites()` does not handle partial vendor issuance**  
+Category: Implementation correctness — compensation correctness  
+Identified: 2026-06-24 (tech lead review)
+
+`writeNonOrgSummariesAtomically()` writes the full `delta = resolveAtomicDelta(kpi, quantityToBeProcessed, ...)` before vendor outcome is known — correct by design (atomic constraint check + write under Redis lock). `compensateFailedSummaryWrites()` is responsible for unwinding this pre-write for any quantity that vendor issuance failed. It has two coupled bugs:
+
+**Bug A — filter:** `.filter(w -> !w.isAnySuccessful())` only fires when `successCount == 0`. `VendorIssueProcessor` makes one vendor API call per qty unit; `successCount` is incremented per success. For qty=2, successCount=1: `isAnySuccessful()` returns `true` → `!isAnySuccessful()` = `false` → the wrapper is excluded from compensation. The 1 failed qty's pre-written `CONSUMED` is **never decremented**.
+
+**Bug B — delta:** Even if Bug A were fixed, `bulkAtomicDecrement(rows)` receives rows whose `consumed` field holds the original full-qty delta. For qty=2, failedQty=1: the decrement would use delta=2 (full) instead of 1 (failed only) — over-decrement by 1.
+
+**Why not use `failureCount`?**  
+`VendorIssueProcessor.java:163` — inside `catch(Exception e)` after `getVendorRewardDetails()` throws (wrapper-level exception covering all qty) — increments `failureCount` by 1 instead of `quantityToBeProcessed`. This breaks the invariant `successCount + failureCount == quantityToBeProcessed` for that path. `failureCount` is unreliable. See T-21.
+
+**Fix (T-20):** Add `getFailedQuantity()` = `quantityToBeProcessed - successCount` to `RewardIssueWrapper`. `successCount` is always reliable (strictly per-unit increment). Fix the filter to `w.getFailedQuantity() > 0` and compute a per-KPI proportional delta:
+- `QUANTITY`: delta = `failedQty`
+- `REDEMPTION_VALUE`: delta = `w.getRedemptionValue() × failedQty`
+- `TRANSACTION_COUNT`: delta = `BigDecimal.ONE` if `failedQty == totalQty` (total failure), else `BigDecimal.ZERO` (partial — the transaction DID happen)
+- `POINTS`: not applicable — rejected at constraint creation time by `RewardConstraintValidation.java:68-69` (`POINTS_KPI_NOT_SUPPORTED`); cannot exist in `writtenSummaryRows` for non-org constraints
+
+**Separate pre-existing bug (T-21):** `VendorIssueProcessor.java:163` — `setFailureCount(failureCount + 1)` should be `setFailureCount(failureCount + quantityToBeProcessed)`. Fix independently; T-20 is immune to this bug because it uses `getFailedQuantity()` (not `failureCount`).
+
 ### 5b. MADR Compliance
 
 MADRs from `.context/overview.md`:
@@ -570,7 +591,8 @@ No upstream change. The `issueReward` API contract is unchanged.
 | 1 | ~~T2/T3/T4 integration tests not fixed before deploy~~ | ~~Medium~~ | ✅ **Closed** — T4 root cause is 10 ms lock timeout, not JPA REPEATABLE_READ (T-10 was valid JDBC cleanup but not the cause). T-19 adds separate reward-lock wait time (5000 ms). T-10 ✅ Done. |
 | 2 | **Reward-level lock timeout too short for production** — `redis.lock.maxWaitTime=10ms` (default) causes threads B–N to time out immediately when Thread A holds the reward lock for its full DB processing time (~10–100 ms in prod). All-but-first concurrent requests fail with `CONSTRAINT_EVALUATION_FAILED` on popular rewards. | **High** | ✅ **Root cause confirmed.** T-19 adds `redis.reward.lock.maxWaitTime` (default 5000 ms) used exclusively in `NonOrgSummaryWriteProcessor`. Existing 10 ms customer-lock timeout unchanged. |
 | 9 | **Lock timeout misconfigured in tests (`REDIS_LOCK_MAX_WAIT_TIME=10ms`)** — confirmed root cause of T3/T4 failures. All threads except Thread A time out. Fixed by T-19 property separation. | High (tests) | T-19: test properties get `redis.reward.lock.maxWaitTime=5000`; prod gets env-var default 5000 ms |
-| 3 | Compensation path not triggered on all failure paths — partial bulk failures leave CONSUMED over-decremented | Low | try-finally in `UserRewardUtils` always fires; compensation is wrapped in try/catch internally |
+| 3 | **Compensation not triggered for partial vendor issuance — `compensateFailedSummaryWrites()` has two coupled bugs.** Bug A: `.filter(w -> !w.isAnySuccessful())` fires only when `successCount==0`; for qty=2 with 1 success, the wrapper is silently excluded. Bug B: decrement delta uses the original full-qty pre-write value instead of the proportional `failedQty` delta. Both bugs leave CONSUMED permanently over-counted for every partial-success vendor issuance. | **High** | T-20: add `getFailedQuantity()` = `quantityToBeProcessed - successCount` to `RewardIssueWrapper`; fix filter to `getFailedQuantity() > 0`; compute per-KPI proportional delta (QUANTITY=failedQty, REDEMPTION_VALUE=rv×failedQty, TRANSACTION_COUNT=1 only on total failure). |
+| 12 | **`VendorIssueProcessor.java:163` — `failureCount` incremented by 1 for wrapper-level exception (pre-existing).** The `catch(Exception e)` path after `getVendorRewardDetails()` throws covers all qty units but calls `setFailureCount(failureCount + 1)` instead of `+ quantityToBeProcessed`. Breaks invariant `successCount + failureCount == quantityToBeProcessed` for this failure path. | Low (pre-existing; T-20 fix is immune via `getFailedQuantity()`) | T-21: change `setFailureCount(failureCount + 1)` → `setFailureCount(failureCount + quantityToBeProcessed)` at `VendorIssueProcessor.java:163`. Independent fix; does not block T-20. |
 | 4 | ORG-level constraints still exposed to Race A and Race C under Phase 1 | Medium (known, accepted; lower severity than REWARD-level) | Deferred to Phase 2; requires `acquireBulkLock()` strategy distinct from the per-reward lock |
 | 5 | `pos13HandledConstraintIds` naming — ~~resolved~~ | — | Renamed to `atomicWrittenConstraintIds` throughout (T-8 ✅ Done) |
 | 6 | ~~Production DDL for `TBL_REWARD_ISSUE_SUMMARY` missing `ON UPDATE CURRENT_TIMESTAMP`~~ | ~~Low~~ | ✅ **Closed** — DBA confirmed production DDL has `ON UPDATE CURRENT_TIMESTAMP` on `LAST_UPDATED_ON`. |
@@ -627,6 +649,8 @@ Q2: Is the `redisLockRegistry` (used by `acquireLock(String key)`) on the same R
 | T-10 | **JDBC SELECT in `writeNonOrgSummariesAtomically()`.** Replaced JPA read with `rewardIssueSummaryJdbcRepository.findExistingForNonOrgLevel()` — correct and future-safe (reads committed data, not JPA snapshot). Investigation confirmed this is NOT the root cause of T3/T4 failure; the actual cause is the 10 ms lock timeout (T-19). | M | — | ✅ Done |
 | T-18 | **Multi-FIXED-window deduplication fix in `writeNonOrgSummariesAtomically()`.** `toAtomicIncrement: List` → `Map<Long, RewardIssueSummary>` keyed by `existing.getId()` (`putIfAbsent`). `toInsert: List` → `Map<String, RewardIssueSummary>` keyed by `level+"\|"+kpi+"\|"+issueDate.getTime()` (`putIfAbsent`). Flush via `.values()`. Decision rationale: typed String/Long keys give correct `equals()` without requiring `RewardIssueSummary.equals()` (which is identity-only — no `@EqualsAndHashCode`). Tests T7 + T8 added. See §5a GAP HIGH Resolution. | S | T-3 | ✅ Done |
 | T-19 | **Separate reward-lock acquire timeout property.** `redis.reward.lock.maxWaitTime=${REDIS_REWARD_LOCK_MAX_WAIT_TIME:5000}` added to both property files. `RewardsApplicationConfiguration.getRedisRewardLockAcquireMaxWaitTime()` added. `RedisLockService.acquireRewardLock(key)` added using `redisLockRegistry` + new wait time. `NonOrgSummaryWriteProcessor` → `acquireRewardLock(lockKey)`. Customer-level `acquireLock(key)` (10 ms) unchanged. `@TestPropertySource` corrected: `redis.lock.maxWaitTime=5000` was overriding the customer lock (wrong), replaced with `redis.reward.lock.maxWaitTime=5000`. Decision rationale: customer lock must fail-fast (10 ms) while reward lock must queue (5000 ms) — two semantics, two properties. See §5a GAP HIGH Resolution. | S | T-4 | ✅ Done |
+| T-20 | **Partial issuance compensation fix.** Add `getFailedQuantity()` = `quantityToBeProcessed - successCount` to `BulkRewardIssueContext.RewardIssueWrapper`. In `RewardConstraintFacade.compensateFailedSummaryWrites()`: (1) change filter from `!w.isAnySuccessful()` → `w.getFailedQuantity() > 0`; (2) build proportional `compensationRows` with delta per KPI (QUANTITY=failedQty, REDEMPTION_VALUE=rv×failedQty, TRANSACTION_COUNT=ONE only on total failure, POINTS=N/A). Pass `compensationRows` (not original rows) to `bulkAtomicDecrement`. Log `(failed={failedQty} of {totalQty})`. See §5a GAP HIGH. | M | T-3 | ⬜ Pending |
+| T-21 | **Fix `VendorIssueProcessor` `failureCount` +1 bug (pre-existing).** `VendorIssueProcessor.java:163` — `setFailureCount(failureCount + 1)` in the `catch(Exception e)` path after `getVendorRewardDetails()` throws is a wrapper-level exception covering all qty; should be `setFailureCount(failureCount + quantityToBeProcessed)`. Independent fix — T-20 is immune (uses `getFailedQuantity()`), but T-21 restores the `failureCount` invariant for any future consumers. | S | — | ⬜ Pending |
 
 ### Testing
 
