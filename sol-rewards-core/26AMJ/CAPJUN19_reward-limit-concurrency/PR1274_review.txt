@@ -1,0 +1,277 @@
+PR #1274 — sol-rewards-core — Code Review
+https://github.com/Capillary/sol-rewards-core/pull/1274
+=========================================================
+
+
+REVIEW 1: CORRECTNESS & CONCURRENCY FIX
+=========================================================
+
+DOES IT FIX THE BUG?
+---------------------
+Partially. The REWARD-level FIXED window race is correctly solved.
+Org-level constraints are not protected — the original race survives for them.
+
+
+APPROACH SUMMARY
+-----------------
+The PR introduces a two-phase reservation in RewardConstraintFacade.reserveSlots():
+
+  Hot path  — atomic UPDATE ... WHERE (CONSUMED + delta) <= limit LIMIT 1.
+              MySQL row-level lock makes this safe under concurrency when a row exists.
+
+  Cold path — acquires a Redis lock scoped to
+              rewardConstraintLock:{orgId}:{rewardId}:{level}:{kpi}:{date},
+              does SELECT SUM, calls ensureSummaryRow if needed, then retries the
+              UPDATE inside the lock. On failure, releaseOnFailure DECRBYs the
+              consumed value back.
+
+This correctly eliminates the duplicate-row INSERT race and the limit breach
+for REWARD-level FIXED constraints.
+
+
+CRITICAL ISSUES (Must Fix Before Merge)
+-----------------------------------------
+
+1. Org-level constraints are not protected — Bug A recurs for org-scope
+
+   validateForOrgLevelConstraints() adds org-level constraints to
+   wrapper.getValidRewardConstraintList() but reserveSlots() is only called at
+   the end of validateForNonOrgLevelConstraints(). Org-level LevelService
+   implementations return isPreReserved() = false, so the entire reservation
+   path is skipped for org-level constraints.
+
+   Two customers simultaneously hitting an org-level FIXED daily constraint still
+   race — both pass the soft evaluation and hit the legacy buildUniqueSummaries /
+   blind SET CONSUMED = :value path. The fix must extend reserveSlots() to cover
+   org-level constraints too.
+
+2. ensureSummaryRow omits LAST_UPDATED_ON — breaks ETL silently
+
+   The new INSERT in RewardIssueSummaryJdbcRepository.ensureSummaryRow() does not
+   include LAST_UPDATED_ON. infra.md guardrail is explicit:
+   "Every rewards_utf8_db table write — lastUpdatedOn must be populated —
+   ETL delta loads depend on it."
+
+   All 4 new UPDATE methods (incrementConsumedRewardLevelForDate,
+   reserveConsumedRewardLevel*, releaseSlot*) also omit LAST_UPDATED_ON = NOW().
+   This will silently break Databricks delta loads on all prod clusters.
+
+3. REDIS_LOCK_TTL env var absent from sol-rewards-core-a.json
+
+   The cold-path Redis lock uses redisLockRegistry backed by redis.lock.ttl
+   (default 5s). This env var is not added to sol-rewards-core-a.json, so all
+   prod clusters use the 5s default. On a slow DB the cold-path ensureSummaryRow
+   + UPDATE could exceed 5s and allow a second thread in. The value needs to be
+   explicitly set and documented in sol-rewards-core-a.json.
+
+
+NON-CRITICAL ISSUES (Should Fix)
+----------------------------------
+
+4. Unsized new HashMap<>() in all 13 new JDBC methods.
+   code.md requires pre-sized collections. Use new HashMap<>(8) for maps with
+   up to 6 entries.
+
+5. computeDelta duplicated byte-for-byte in LevelService and
+   CustomerLevelReservationHelper. Violates DRY — if POINTS KPI calculation
+   changes in one place the other diverges silently.
+
+6. Redundant inner Redis lock for CUSTOMER-level constraints.
+   The outer @CustomerLockable already serializes per-customer. The inner lock in
+   CustomerLevelReservationHelper for CUSTOMER-level is redundant overhead.
+
+7. RedisCacheKeys constant rewardConstraintLock: is unquoted.
+   Every other key in that file is SpEL-quoted. Add a comment explaining it is a
+   lock prefix, not a cache name.
+
+
+TEST COVERAGE GAPS
+-------------------
+
+  Missing Scenario                                             Why It Matters
+  -------------------------------------------------------------------
+  Two different customers hitting an org-level FIXED          Directly tests the
+  constraint concurrently                                     unfixed Bug A path
+
+  Same customer firing 3 concurrent requests on a             Verifies @CustomerLockable
+  CUSTOMER-level constraint                                   serializes and inner lock
+                                                              is redundant
+
+  ROLLING window at REWARD level under concurrency            reserveConsumedRewardLevel
+                                                              (no date) hot path has no
+                                                              integration test
+
+  ensureSummaryRow race — two threads both see sum=null       Verifies exactly one row
+  simultaneously                                              created, not two
+
+  releaseOnFailure with KPI=POINTS integration test           Only QUANTITY KPI is
+                                                              exercised end-to-end
+
+  Lock TTL expiry mid-operation                               Validates breach does not
+                                                              occur if Redis lock expires
+                                                              during slow DB op
+
+  issueRewardBulk + single issueReward racing on same         Bulk path not covered in
+  REWARD-level constraint                                     concurrency tests
+
+
+CORRECTNESS VERDICT: REQUEST CHANGES
+--------------------------------------
+The REWARD-level fix is correct and the hot-path atomic UPDATE approach is solid.
+Three critical issues must be resolved before merge:
+  - Org-level constraints must be included in the reservation path
+  - LAST_UPDATED_ON must be added to every new DB write
+  - Lock TTL must be explicitly configured in sol-rewards-core-a.json
+Once those are fixed and an org-level concurrency test is added, this is mergeable.
+
+
+=========================================================
+REVIEW 2: CLEAN CODE, NAMING & CLASS DESIGN
+=========================================================
+
+NAMING ISSUES
+--------------
+
+  Current Name                    Suggested Name                    Reason
+  -----------------------------------------------------------------------
+  jdbcRepo (field in             rewardIssueSummaryJdbcRepository  Every other class names
+  CustomerLevelReservation                                          this dependency by its
+  Helper)                                                           full type
+
+  svc (local var in              levelService                       Same class already uses
+  RewardConstraintFacade)                                           levelService everywhere
+                                                                    pre-PR
+
+  getBindingPreReserved          filterBindingPreReservedConstraints  get implies a simple
+  Constraints                                                          accessor; this method
+                                                                       filters + transforms
+
+  computeUnitDelta               computePerItemDelta               "unit" is ambiguous;
+                                                                    "perItem" is exact
+
+  Long user_id (parameter)       Long userId                       Snake_case in Java param
+                                                                    names — appears in ~4
+                                                                    new methods
+
+  reserveSlots /                 reserveConstraintSlots /          Asymmetric pair hides
+  releaseOnFailure               releaseConstraintSlotsOnFailure   symmetry
+
+  buildCustomerLockKey /         buildConstraintLockKey in both    Same concept, divergent
+  buildRewardLockKey                                               names hide the pattern
+
+
+CLASS DESIGN ISSUES
+--------------------
+
+1. RewardLevelService — two responsibilities
+
+   Pre-PR: pure read-side LevelService (KPI loading, summary building, evaluation).
+   Post-PR: also owns the full reservation/release protocol — Redis lock acquisition,
+   cycle-sum query, ensureSummaryRow, computeCycleEnd (~140 new lines added).
+
+   The project explicitly created CustomerLevelReservationHelper to isolate
+   customer-level reservation away from *LevelService classes. That extraction was
+   not applied here. A RewardLevelReservationHelper mirroring
+   CustomerLevelReservationHelper would restore cohesion and complete the pattern.
+
+2. RewardIssueSummaryJdbcRepository — nearly tripled in size
+
+   Pre-PR: ~182 lines. Post-PR: ~495 lines. The new methods split cleanly into two
+   symmetric groups: reward-level (no userId) and customer-level (with userId).
+   Separate RewardLevelSummaryJdbcRepository and CustomerLevelSummaryJdbcRepository
+   would match the SRP enforced on the service layer and prevent the file from
+   becoming unmanageable when a third constraint level is added.
+
+
+DUPLICATION (all in newly added code)
+---------------------------------------
+
+1. hasSiblingWindowed check — 4 copies
+     CustomerLevelReservationHelper.reserveSlot
+     CustomerLevelReservationHelper.releaseSlot
+     RewardLevelService.reserveSlot
+     RewardLevelService.releaseSlot
+   Extract to:
+     RewardConstraintHelper.hasSiblingWindowedConstraint(RewardConstraint, List<RewardConstraint>)
+
+2. computeDelta — 2 copies
+     LevelService.computeDelta (new concrete method)
+     CustomerLevelReservationHelper.computeDelta (private copy)
+   Move to RewardConstraintHelper, which both already autowire.
+
+3. trimmedIssualDate / issueDate computation — 2 copies
+     RewardConstraintFacade.reserveSlots
+     RewardConstraintFacade.releaseOnFailure
+   Extract to:
+     private ReservationDates resolveIssueDates(ZoneId, BulkRewardIssueContext.RewardIssueWrapper)
+
+4. releaseAllPreReservedSlots loop — 2 copies
+     UserRewardUtils.issueRewardBulk (empty list branch)
+     UserRewardUtils.issueReward (else branch)
+   Both call rewardConstraintFacade.releaseOnFailure(...) + w.setSlotsReserved(false)
+   on every isSlotsReserved() wrapper. Extract to:
+     private void releaseAllPreReservedSlots(BulkRewardIssueContext)
+
+
+COMMENT QUALITY
+----------------
+
+Comments to REMOVE (they restate the method name — no information added):
+  All section-header comments in RewardIssueSummaryJdbcRepository such as:
+    // REWARD level (USER_ID IS NULL) — getTotalConsumed
+    // Customer level windowed
+    // Customer level — reserveConsumed
+    // Customer level windowed — reserveConsumedWindowed
+    ... nine of this style in total
+
+Comments MISSING (non-obvious WHY not explained):
+  - Before `if (userId == null) return true` in CustomerLevelReservationHelper —
+    WHY null userId is a pass-through not an error (reward-level constraints use
+    userId=null by design; filtering is the caller's responsibility)
+
+  - On `ORDER BY ID ASC LIMIT 1` in the UPDATE —
+    WHY: defensive guard against updating multiple rows if a data inconsistency
+    created duplicates. Not obvious from reading the SQL alone.
+
+  - On LinkedHashMap in getBindingPreReservedConstraints —
+    WHY: order-preservation ensures rollback processes constraints in reservation order
+
+  - On computeCycleEnd WEEKS -> plusDays(7) —
+    WHY: explain difference from plusWeeks(1) for anchored cycle use cases
+
+
+MAGIC LITERALS
+---------------
+
+  Literal                           Fix
+  -----------------------------------------------------------------------
+  ":REWARD:" hardcoded in           Use rc.getConstraintLevel().name() like
+  RewardLevelService.               CustomerLevelReservationHelper already does.
+  buildRewardLockKey                Eliminates the string and the asymmetry between
+                                    the two helpers.
+
+  7 (days) in computeCycleEnd       Replace plusDays(7) with plusWeeks(1) —
+                                    removes the literal entirely and is semantically
+                                    clearer.
+
+  ". Limit reached by concurrent    Extract to a named constant alongside other
+  request." inline in processor     StatusCode constants.
+
+
+CLEAN CODE VERDICT: REQUEST CHANGES
+--------------------------------------
+The dominant structural gap is that the helper-extraction pattern was applied to
+customer-level constraints but not to reward-level constraints. RewardLevelService
+now carries both read-side and reservation responsibilities, breaking the symmetry
+the codebase was building toward. The computeDelta duplication and the
+hasSiblingWindowed four-copy duplication are both in newly added code — any future
+rule change requires four simultaneous edits. Naming regressions (user_id snake_case,
+svc, jdbcRepo) are individually small but collectively inconsistent with surrounding
+conventions.
+
+Request changes on:
+  1. Extract RewardLevelReservationHelper (mirrors CustomerLevelReservationHelper)
+  2. Consolidate computeDelta and hasSiblingWindowed to RewardConstraintHelper
+  3. Fix naming regressions (user_id, svc, jdbcRepo, getBinding* -> filterBinding*)
+  4. Remove label-style comments; add WHY comments on LIMIT 1 guard and lock key design
+  5. Replace ":REWARD:" string literal with rc.getConstraintLevel().name()

@@ -477,7 +477,7 @@ prioritising Phase 2. Phase 1 covers `WindowType.FIXED` and `RepeatFrequencyType
 - `LevelService` implementations and `refreshSummary` — retained for ROLLING window path
   and for the `fetchCurrentRewardSummary` read API (get-user-rewards)
 - `CustomerLockManager` — customer lock stays as-is (still useful for per-customer CUSTOMER-level constraints)
-- `bulkSaveOrUpdate()` — retained as-is; pos 13 calls it for REWARD/CUSTOMER-level writes inside the lock; ROLLING constraints still go through `updateSummaries()` unchanged
+- `bulkSaveOrUpdate()` — retained as-is; used by `updateSummaries()` for ORG-level writes only. Pos 13 uses `save()` (INSERT) and `bulkAtomicIncrement()` (CONSUMED + delta) — not `bulkSaveOrUpdate()`. ORG-level constraints (any WindowType) still go through `updateSummaries()` unchanged until Phase 2
 - Databricks ETL pipeline — no change; it reads `TBL_REWARD_ISSUE_SUMMARY` the same way
 - Existing duplicate rows in `TBL_REWARD_ISSUE_SUMMARY` — not cleaned up in this ticket;
   MySQL remains the authoritative store; the Redis lock prevents new duplicates from forming
@@ -503,9 +503,10 @@ prioritising Phase 2. Phase 1 covers `WindowType.FIXED` and `RepeatFrequencyType
    pos 13 throws and the request is abandoned, `BulkRewardIssueContext.writtenSummaryRows` is
    read to issue `CONSUMED = CONSUMED - delta` for each written row. Breaks if the failure path
    exits without calling the compensation logic.
-6. **ROLLING window constraints are a known minority** — Phase 1 explicitly leaves ROLLING
-   unprotected. If ROLLING is a majority (>50% of active constraints), Phase 2 urgency changes
-   and should be raised to the same sprint rather than deferred.
+6. **ROLLING window REWARD/CUSTOMER-level constraints are covered by Phase 1** — `NonOrgSummaryWriteProcessor`
+   filters by Level (REWARD, CUSTOMER), not by WindowType. `writeNonOrgSummariesAtomically()` resolves
+   `issualDate` for ROLLING (vs `eventDate` for FIXED) — correct row key for each window type. Phase 2
+   urgency is driven by ORG-level constraint coverage, not by ROLLING window coverage.
 
 ---
 
@@ -516,7 +517,7 @@ prioritising Phase 2. Phase 1 covers `WindowType.FIXED` and `RepeatFrequencyType
 | Compensation path not triggered on all failure paths — partial bulk failures leave CONSUMED over-decremented | Medium | Wrap pos 13 write and compensation in a try-finally keyed on `writtenSummaryRows`; call compensation from the top-level error handler, not only from pos 13. |
 | `lastUpdatedOn` not updated by new compensation `bulkUpdate()` SQL — breaks Databricks delta ETL which depends on `lastUpdatedOn` for daily delta loads | High | Add `lastUpdatedOn = NOW()` to both the increment SQL and the compensation decrement SQL. Verify via `.context/infra.md` guardrail: "Every rewards_utf8_db table write must populate `lastUpdatedOn`". |
 | Lock TTL misconfigured below GC pause headroom — lock expires while thread is in GC stop-the-world, another thread enters | Low | Set lock TTL = MAX(current `redis.lock.ttl`, P99 of `/issueReward` + 5s buffer). Confirm via New Relic before build. |
-| ROLLING window constraints still exposed to Race A and Race C under Phase 1 — no fix in this ticket | High (known) | Explicitly note in code comment on `NonOrgSummaryWriteProcessor` that ROLLING constraints are excluded. Add monitoring alert on CONSUMED breach for ROLLING-type constraints as a proxy to detect Phase 2 urgency. |
+| ORG-level constraints still exposed to Race A and Race C under Phase 1 | Medium (known, accepted) | `NonOrgSummaryWriteProcessor` skips ORG-level via `REWARD_CONSTRAINT_ALLOWED_LEVELS` filter; Phase 2 covers ORG-level with `acquireBulkLock()` strategy. ROLLING REWARD/CUSTOMER-level IS covered by Phase 1. |
 | `updateSummaries()` double-write if CQ9 coordination is implemented incorrectly — filter uses wrong field (e.g., `rewardId` instead of row `id`) | Medium | Unit-test filter logic with a mix of REWARD-level (excluded) and ORG-level (included) rows in the same context. Integration test T4b should catch this. |
 
 ---
@@ -1210,9 +1211,10 @@ List<RewardIssueSummary> pendingWrites = allSummaries.stream()
 | REWARD-level (FIXED / NO_LIMIT) | pos 13 `NonOrgSummaryWriteProcessor` | Inside lock, before external calls |
 | CUSTOMER-level (FIXED / NO_LIMIT) | pos 13 `NonOrgSummaryWriteProcessor` | Inside lock (customer lock already held; no cross-customer conflict) |
 | ORG-level | `updateSummaries()` (unchanged) | After external calls, as today |
-| ROLLING window (any level) | `updateSummaries()` (unchanged) | After external calls, as today — Race A and C remain for ROLLING in Phase 1 |
+| ROLLING window, REWARD/CUSTOMER-level | pos 13 `NonOrgSummaryWriteProcessor` (inside lock) | `writeNonOrgSummariesAtomically()` uses `issualDate` for ROLLING; atomic increment handles it identically to FIXED — Race A and Race C fixed |
+| ROLLING window, ORG-level | `updateSummaries()` (unchanged) | After external calls, as today — ORG-level deferred to Phase 2 |
 
-**Explicit out-of-scope for Phase 1:** ROLLING window constraints are not protected by pos 13's lock. Race A (cross-customer breach) and Race C (blind overwrite) remain for ROLLING constraints. The test-plan architect must NOT write ROLLING post-fix assertions expecting them to pass — those belong to Phase 2.
+**Explicit out-of-scope for Phase 1:** ORG-level constraints (`rewardId = -1L`) are not protected by pos 13's lock — they require a different strategy (`acquireBulkLock()`) and are deferred to Phase 2. ROLLING window REWARD/CUSTOMER-level constraints ARE covered: pos 13's lock is per `orgId:rewardId` (not window-type-dependent), and `writeNonOrgSummariesAtomically()` correctly resolves `issualDate` for ROLLING rows ([RewardConstraintFacade.java:487](src/main/java/com/capillary/solutions/rewards/service/impl/RewardConstraintFacade.java)). The test-plan architect should write ROLLING REWARD-level post-fix assertions with the same pass expectations as FIXED window tests.
 
 ---
 

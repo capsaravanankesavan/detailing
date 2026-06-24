@@ -79,7 +79,7 @@ The `-1L` sentinel for `rewardId` is defined at `Constants.ORG_LEVEL_REWARD_ID` 
 | KPI | What it counts | Supported constraint levels | Notes |
 |---|---|---|---|
 | `QUANTITY` | Number of reward issuances | REWARD, CUSTOMER, org-level | Most common. `kpiValue = requestedQuantity` |
-| `POINTS` | Intouch points redeemed at issuance | REWARD, CUSTOMER, org-level | `kpiValue = pointsPerUnit × quantity` |
+| `POINTS` | Intouch points redeemed at issuance | **org-level only** | `kpiValue = pointsPerUnit × quantity`. Rejected at REWARD/CUSTOMER level constraint creation by `RewardConstraintValidation.validateEachLevel():68` (`POINTS_KPI_NOT_SUPPORTED`). The runtime processing code handles POINTS (see `resolveAtomicDelta()`, `updateSummaries()`) because it serves org-level constraints; this does NOT mean it is configurable at reward/customer level. |
 | `REDEMPTION_VALUE` | Monetary value converted at issuance (CONV_RATIO rewards only) | REWARD, CUSTOMER **only** | Not supported at org-level — see below |
 | `TRANSACTION_COUNT` | Count of transactions | (deprecated) | `evaluate()` always returns `true`; no limit enforced |
 
