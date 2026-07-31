@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>              <style>
+                .session-terminated-message {
+                  color: white;
+                  background: rgba(255, 0, 0, 0.9);
+                  position: fixed;
+                  top: 0px;
+                  left: 800px;
+                  transform: translate(-50, -50);
+                  padding: 15px 30px;
+                  font-size: 18px;
+                  border-radius: 8px;
+                  text-align: center;
+                  z-index: 9999;
+                }
+              </style>
+                  <script>
+        (function() {
+           // Monitor XMLHttpRequests for Error Requests
+            const originalXHROpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+              this.addEventListener('error', function() {
+                try {
+                  // Check for specific header values
+                  const toolsAuthStatus = this.getResponseHeader('x-crm-tools-auth-status');
+                  if (this.status === 0) {
+                    showPopUpMessage("Error: Action cannot be performed.");
+                  }
+                } catch (error) {
+                  console.error("Error processing response headers:", error);
+                }
+              });
+
+              originalXHROpen.apply(this, arguments);
+            };
+
+            // Monitor XMLHttpRequests for Session Expiry
+             XMLHttpRequest.prototype.open = function(method, url) {
+               this.addEventListener('loadend', function() {
+                 try {
+                   // Check for specific header values
+                   const toolsAuthStatus = this.getResponseHeader('x-crm-tools-auth-status');
+                   if (toolsAuthStatus && toolsAuthStatus === "401 Unauthorized"){
+                     showPopUpMessage("Your session has expired. Please re-login.");
+                     // Optionally, reload the page after a delay
+                     setTimeout(() => {
+                       reloadPage();
+                     }, 3000);
+                   }
+                 } catch (error) {
+                   console.error("Error processing response headers:", error);
+                 }
+               });
+
+               originalXHROpen.apply(this, arguments);
+             };
+
+
+          // Store the original fetch function
+            const originalFetch = window.fetch;
+            window.fetch = async function (...args) {
+              // Call the original fetch function
+              const response = await originalFetch.apply(this, args);
+              try {
+                // Check if  crm-tools-error header exists
+                const toolsAuthStatus = response.headers.get('x-crm-tools-auth-status');
+                if (toolsAuthStatus && toolsAuthStatus === "401 Unauthorized") {
+                  showPopUpMessage("Your session has expired. Please re-login.");
+                  setTimeout(() => {
+                    reloadPage();
+                  }, 3000);
+                }
+              } catch (error) {
+                console.error("Error reading response headers:", error);
+              }
+
+              // Return the original response (unmodified) to the consuming code
+              return response;
+            };
+
+          // Function to display the "session terminated" message
+          function showPopUpMessage(message) {
+            if (!document.getElementById('session-terminated-message')) {
+              const messageDiv = document.createElement('div');
+              messageDiv.id = 'session-terminated-message';
+              messageDiv.className = 'session-terminated-message';
+              messageDiv.innerText = message;
+              document.body.appendChild(messageDiv);
+              // Remove the message after 5 seconds
+              setTimeout(() => {
+                document.body.removeChild(messageDiv);
+              }, 5000);
+            }
+          }
+
+          // Function to reload the page
+          function reloadPage() {
+            console.log("Session expired, reloading page...");
+            location.reload(); // Trigger a page reload
+          }
+        })();
+
+      </script>
+    
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>Rewards ↔ Audience Manager: A 2-Phase Plan</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      white-space: pre-wrap;
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">Rewards ↔︎ Audience Manager: A 2-Phase Plan</h1>
+<p class="subtitle">Phase 1: Reward↔︎AudienceGroup · Phase 2:
+Reward↔︎AudienceGroupSet</p>
+</header>
+<h2 id="rewards-audience-manager">Rewards ↔︎ Audience Manager</h2>
+<h3 id="linking-rewards-to-audience-groups-phase-1-phase-2">Linking
+Rewards to Audience Groups — Phase 1 &amp; Phase 2</h3>
+<hr />
+<p>Rewards Catalogue · Audience Integration · Design Doc:
+rewards-audience-manager-consolidated-design.md</p>
+<h1 id="gating-rewards-by-audience-membership-the-2-phase-plan">Gating
+Rewards by Audience Membership — the 2-Phase Plan</h1>
+<p>How Rewards will link to Audience Manager to show a reward only to
+eligible users — why a naive “one reward, many groups” model breaks, why
+the fix belongs in Audience Manager, and the phased path to get
+there.</p>
+<p><strong>STATUS: DESIGN EXPLORATION — SEEKING ALIGNMENT</strong> ·
+Discussed with: AM Architect · Product · Team Lead</p>
+<hr />
+<h2 id="the-business-problem">The Business Problem</h2>
+<h3
+id="brands-want-to-target-rewards-by-audience-today-theres-no-way-to-do-it">Brands
+want to target rewards by audience — today there’s no way to do it</h3>
+<p><strong>What Product asked for</strong></p>
+<p>A brand admin should be able to link a Reward to one or more Audience
+Groups (e.g. “Gold tier customers”), so that in the Catalogue, the
+reward is shown <strong>only</strong> to users who belong to one of
+those groups.</p>
+<p><strong>Why it’s not simple</strong></p>
+<p>Audience Group membership isn’t instant — a group has to be
+“materialized” (built and activated) in Audience Manager before it can
+even be checked. Getting the linking, timing, and edit behavior right —
+without ever showing a half-configured or inconsistent reward — is the
+hard part.</p>
+<hr />
+<p><strong>0</strong></p>
+<p>ways today for a Reward to be gated by audience membership</p>
+<p><strong>2</strong></p>
+<p>hard requirements from Product that any design must satisfy</p>
+<p><strong>3</strong></p>
+<p>data models explored before landing on the right one</p>
+<hr />
+<h2 id="existing-building-blocks-where-we-start">Existing Building
+Blocks · Where We Start</h2>
+<h3
+id="what-rewards-and-audience-manager-already-have-independently">What
+Rewards and Audience Manager already have, independently</h3>
+<p>Reward arrives → needs eligibility → <strong>no audience concept
+exists</strong> → Audience Manager owns groups → group has a lifecycle →
+<strong>not connected today</strong></p>
+<p><strong>Reward (Rewards system)</strong> A brand-configured incentive
+shown in Catalogue. Today: zero concept of audience-based
+visibility.</p>
+<p><strong>Audience Group (Audience Manager)</strong> A brand-defined
+segment, backed by a filter rule evaluated live via an external rule
+engine (RBS). Lifecycle: created → lookup enabled → materializing →
+<strong>READY</strong> (or ERROR). Membership checks only work once
+<code>READY</code>.</p>
+<p>The gap: nothing today lets a Reward say <em>“only show me to users
+in Audience Group G.”</em> Everything that follows is about closing that
+gap correctly.</p>
+<hr />
+<h2 id="reference-products-two-hard-requirements">Reference · Product’s
+Two Hard Requirements</h2>
+<h3 id="the-rules-any-design-must-satisfy-no-exceptions">The rules any
+design must satisfy, no exceptions</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>#</th>
+<th>Requirement</th>
+<th>Plain English</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R1</td>
+<td><strong>Hassle-free launch</strong></td>
+<td>A reward should launch <strong>only when all its linked audience
+groups are READY</strong> — never half-configured</td>
+</tr>
+<tr>
+<td>R2</td>
+<td><strong>No mixed state on edit</strong></td>
+<td>Editing a reward’s group list (e.g. <code>[AG1,AG2,AG3]</code> →
+<code>[AG1,AG4,AG5]</code>) must <strong>never</strong> serve a mixed
+combination mid-transition — it’s the complete old set, or the complete
+new set. Never <code>[AG1,AG4]</code> alone</td>
+</tr>
+</tbody>
+</table>
+<p>These two rules — not engineering preference — are what eliminated
+our first design and drove us to the final model. Everything on the next
+few slides traces back to satisfying R1 and R2.</p>
+<hr />
+<h2 id="the-first-design-we-tried">The First Design We Tried</h2>
+<h3 id="reward-1-audience-group-the-obvious-model">Reward (1) —— (*)
+Audience Group — the obvious model</h3>
+<p>Reward created → admin picks N groups → save a flat list →
+<strong>that’s it?</strong></p>
+<p>It looks obviously right: a reward can need more than one group, so
+make it a list. This is where the trouble starts.</p>
+<hr />
+<h2 id="where-it-breaks-create-r1">Where It Breaks · CREATE (R1)</h2>
+<h3 id="audience-manager-has-no-concept-of-jointly-ready">Audience
+Manager has no concept of “jointly ready”</h3>
+<p><strong>What we need</strong></p>
+<p>Don’t launch the reward until <strong>every</strong> linked group
+reports <code>READY</code>.</p>
+<p><strong>What AM actually gives us</strong></p>
+<p>AM tracks readiness strictly <strong>per group,
+independently</strong> — there is no primitive anywhere for “this set of
+groups is jointly ready.” Rewards would have to invent and track that
+joint-readiness fact itself, watching whichever group finishes
+materializing last.</p>
+<p>Not a blocker by itself — this alone could be solved with a
+background watcher. The real break is on the next slide.</p>
+<hr />
+<h2 id="where-it-breaks-edit-r2-the-harder-one">Where It Breaks · EDIT
+(R2) — the harder one</h2>
+<h3
+id="a-flat-mutable-list-cannot-represent-old-and-new-at-the-same-time">A
+flat, mutable list cannot represent “old” and “new” at the same
+time</h3>
+<p>Old list serving <code>[AG1,AG2,AG3]</code> → admin edits to
+<code>[AG1,AG4,AG5]</code> → <strong>mutate in place?</strong> → a
+concurrent Catalogue read can see a half-updated list → <strong>exactly
+the forbidden mixed state</strong></p>
+<p><strong>The root cause</strong></p>
+<p>You need <strong>two full generations of the group-list to
+coexist</strong> — one still live, one materializing in the background —
+until the new one is completely ready, then swap atomically. A flat,
+single list has no place to put a second generation.</p>
+<p>We were conflating two different kinds of state that need separate
+homes: (1) per-group status — AM already gives us this — and (2)
+per-edit “is this whole new set ready as a unit” — AM gives us nothing
+for this, and a flat list has nowhere to keep it.</p>
+<hr />
+<h2 id="the-entity-we-designed-to-fix-it">The Entity We Designed To Fix
+It</h2>
+<h3
+id="a-versioned-wrapper-never-mutate-the-live-list-always-mint-a-new-one">A
+versioned wrapper — never mutate the live list, always mint a new
+one</h3>
+<pre><code>RewardAudiences  (one row = one &quot;generation&quot; of a group-list)
+  ├─ status: PENDING_ACTIVATION | ACTIVE | ARCHIVED
+  └─ (*) AudienceGroup   [the set, for this generation]</code></pre>
+<p>Edit reward → mint NEW generation (PENDING_ACTIVATION) → old
+generation keeps serving, untouched → new generation’s groups
+materialize in background → all READY? → atomic swap → old generation
+archived</p>
+<p><strong>The key trick:</strong> subscribe to Audience Manager using
+<code>entityId = reward_audiences.id</code>, not <code>rewardId</code> —
+so the old generation’s AM subscriptions and the new generation’s AM
+subscriptions are two completely independent, non-interfering lineages.
+This is what makes “old keeps serving while new materializes” actually
+work.</p>
+<p>This correctly solves R1 and R2. But it raised a bigger question — is
+this really a Rewards-domain concept?</p>
+<hr />
+<h2 id="the-question-we-took-to-the-am-architect">The Question We Took
+To The AM Architect</h2>
+<h3
+id="is-a-live-evaluatable-set-of-groups-really-rewards-domain-logic">“Is
+a live, evaluatable set of groups really Rewards-domain logic?”</h3>
+<p>We checked three existing Audience Manager concepts, to see if “a set
+of groups treated as one unit” could reuse something that already
+exists, rather than inventing it fresh inside Rewards.</p>
+<hr />
+<h2 id="reference-what-we-checked-in-audience-manager">Reference · What
+We Checked In Audience Manager</h2>
+<h3 id="three-existing-am-concepts-and-whether-they-fit">Three existing
+AM concepts, and whether they fit</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>AM Concept</th>
+<th>Does it fit our need?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Parent/Child Audience hierarchy</td>
+<td><strong>No</strong> — single parent per child, rigid AND-composition
+tree, built for nested refinement — not an admin-chosen arbitrary
+set</td>
+</tr>
+<tr>
+<td>MERGE (Union / Intersect)</td>
+<td><strong>Partial</strong> — AM can compute “A OR B,” but only as a
+static, materialized snapshot (a batch file merge) — not a live filter a
+real-time lookup can resolve</td>
+</tr>
+<tr>
+<td>Multiple rules per group</td>
+<td><strong>No</strong> — one Audience Group = exactly one rule, always.
+Multiple rules = multiple groups</td>
+</tr>
+</tbody>
+</table>
+<p>None of the three is a fit as-is. But the pattern across all three is
+telling: every primitive this idea would need — group definitions, rule
+evaluation, live materialization, RBS integration — already lives inside
+Audience Manager, just not assembled into a “live set” concept yet.</p>
+<hr />
+<h2 id="outcome-with-the-am-architect">Outcome With The AM
+Architect</h2>
+<h3
+id="joint-conclusion-this-belongs-in-audience-manager-not-rewards">Joint
+conclusion: this belongs in Audience Manager, not Rewards</h3>
+<p><strong>“A set of groups, evaluated live, potentially with OR logic,
+is fundamentally an Audience Manager domain concept — it belongs next to
+Audience Group and the hierarchy, not reinvented inside
+Rewards.”</strong></p>
+<p><strong>Why AM, not Rewards</strong></p>
+<ul>
+<li>AM already owns every primitive this needs — group definitions, rule
+evaluation, live materialization, RBS integration</li>
+<li>Rewards would otherwise duplicate group-set semantics that
+conceptually belong where groups themselves live</li>
+<li>Other future consumers beyond Rewards will want “match any of these
+groups” too — solving it once in AM benefits the whole platform</li>
+<li>AM is the only place that could ever deliver <strong>true live
+OR/union</strong> — Rewards building its own set-tracking can never get
+past AM’s materialized-snapshot limitation</li>
+</ul>
+<p>This new AM entity doesn’t exist today. We’re calling it
+<strong>AudienceGroupSet</strong> — a forward-looking AM roadmap ask,
+not something to block our launch on.</p>
+<hr />
+<h2 id="our-answer-a-2-phase-plan">Our Answer · A 2-Phase Plan</h2>
+<h3
+id="ship-now-on-what-exists.-extend-once-am-builds-the-set-entity.">Ship
+now on what exists. Extend once AM builds the set entity.</h3>
+<p>Phase 1 (now) Reward (1)—(1) Audience Group → ships on AM as-is
+today</p>
+<p>Phase 2 (future) Reward (1)—(1) Audience Group <strong>Set</strong> →
+once AM builds AudienceGroupSet</p>
+<p><strong>Why strict 1-to-1 first is not a compromise</strong></p>
+<p>Only one group ⇒ no combination to ever be “mixed” ⇒ <strong>R2 is
+eliminated by design</strong>, not engineered around. Readiness check
+happens <strong>before</strong> linking is allowed ⇒ <strong>R1 is
+satisfied by construction</strong> — no background cutover machinery
+needed at all.</p>
+<hr />
+<h2 id="phase-1-data-model">Phase 1 · Data Model</h2>
+<h3 id="reward-1-1-audience-group">Reward (1) —— (1) Audience Group</h3>
+<pre><code>Reward
+ ├─ audience_group_id            (single FK, nullable)
+ ├─ audience_group_last_status   (cached: READY | PROCESSING | ERROR)
+ └─ audience_group_last_checked_at</code></pre>
+<p>Deliberately the simplest possible shape — a single nullable pointer
+plus a cached status for display. No versioning, no generations, no
+background cutover job needed, because there is never more than one
+group to coordinate.</p>
+<p><strong>What this needs from AM:</strong> nothing new. Phase 1 uses
+Audience Manager’s existing <code>subscribe()</code> and status-check
+APIs exactly as they are today.</p>
+<hr />
+<h2 id="phase-1-brand-admin-experience-create">Phase 1 · Brand Admin
+Experience — CREATE</h2>
+<h3 id="finish-setup-in-am-first-then-link-in-rewards">Finish setup in
+AM first, then link in Rewards</h3>
+<p>Admin sets up Audience Group in <strong>AM UI</strong> → waits for
+<code>READY</code> → opens <strong>Rewards UI</strong> → picks that
+group to link → <strong>Rewards blocks the link unless it’s already
+READY</strong> → link succeeds → reward is immediately eligible, no
+waiting</p>
+<p>If the group isn’t ready yet, Rewards UI shows a clear message:
+<em>“Finish setting this up in Audience Manager first.”</em> No polling,
+no pending state inside Rewards — readiness is guaranteed the moment
+linking is allowed to succeed.</p>
+<hr />
+<h2 id="phase-1-brand-admin-experience-edit">Phase 1 · Brand Admin
+Experience — EDIT</h2>
+<h3 id="a-single-atomic-pointer-swap-no-transition-window-at-all">A
+single atomic pointer swap — no transition window at all</h3>
+<p>Admin picks a <strong>different</strong>, already-<code>READY</code>
+group → same gate applies → reward keeps serving the
+<strong>old</strong> group, completely unchanged, until the swap fires →
+swap is one atomic field update, not a multi-step transition → old group
+unsubscribed only if no other reward still uses it</p>
+<p>Because there is only ever one group, R2’s “never serve a mix”
+requirement isn’t something we engineer around with versioning — there
+is structurally nothing to mix. The edit either hasn’t happened yet (old
+group, fully valid) or has happened (new group, fully valid).</p>
+<hr />
+<h2 id="phase-2-data-model">Phase 2 · Data Model</h2>
+<h3 id="same-shape-new-target-reward-1-1-audience-group-set">Same shape,
+new target — Reward (1) —— (1) Audience Group <strong>Set</strong></h3>
+<pre><code>Reward
+ ├─ audience_group_set_id           (single FK — now points at a SET)
+ ├─ audience_group_set_last_status
+ └─ audience_group_set_last_checked_at</code></pre>
+<p>Rewards’ own model barely changes from Phase 1 — the complexity of
+“many groups, joint readiness, OR logic” stays entirely inside AM’s new
+entity. This is exactly why Phase 1’s shape matters: it’s
+forward-compatible with almost no rework on the Rewards side.</p>
+<hr />
+<h2 id="phase-2-brand-admin-experience">Phase 2 · Brand Admin
+Experience</h2>
+<h3
+id="true-or-across-groups-eligibility-once-am-builds-the-set-entity">True
+OR-across-groups eligibility, once AM builds the set entity</h3>
+<p>Admin builds a <strong>set</strong> of groups in <strong>AM
+UI</strong> (e.g. “Gold tier OR Platinum tier”) → AM materializes +
+tracks joint readiness for the whole set → admin opens Rewards UI, picks
+that <strong>set</strong> → same pre-link readiness gate, now checking
+the whole set → reward supports true OR-across-groups eligibility,
+live</p>
+<p>Edit flow is identical in shape to Phase 1 — swap the
+<code>audience_group_set_id</code> pointer only when the new target set
+is ready. AM’s set entity internally handles multi-group materialization
+and versioning — Rewards doesn’t reinvent generation-tracking, because
+AM does it once for every consumer.</p>
+<hr />
+<h2 id="what-phase-2-needs-from-audience-manager">What Phase 2 Needs
+From Audience Manager</h2>
+<h3 id="the-roadmap-ask-made-concrete">The roadmap ask, made
+concrete</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Ask</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>New entity: AudienceGroupSet</td>
+<td>A brand-defined collection of groups, with joint readiness tracking
+and — ideally — live OR/union evaluation, not just a materialized
+snapshot</td>
+</tr>
+<tr>
+<td>UI support</td>
+<td>Brand admins need an AM-side UI to create/manage a set: add/remove
+member groups, see per-group <strong>and</strong> overall set
+status</td>
+</tr>
+<tr>
+<td>APIs</td>
+<td>subscribe / status / lookup equivalents scoped to a set, mirroring
+today’s per-group APIs — so Rewards’ integration pattern carries over
+unchanged</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="where-we-are">Where We Are</h2>
+<h3
+id="design-explored.-am-architect-aligned.-ready-to-socialize-with-product.">Design
+explored. AM architect aligned. Ready to socialize with Product.</h3>
+<p><strong>Status</strong></p>
+<p>Phase 1: design solves R1 + R2 by construction, no AM changes needed
+— ready to formalize Phase 2: needs AudienceGroupSet on the AM roadmap —
+not yet committed</p>
+<p>This deck reflects a design exploration, not yet a formally reviewed
+and arbiter-approved plan. Once Phase 1’s shape is confirmed with
+Product, it goes through the standard design review (Senior ·
+Architecture · QA) and arbiter gate before implementation.</p>
+<p><strong>One dependency</strong></p>
+<p>Phase 2 cannot start until Audience Manager commits to building
+AudienceGroupSet — a roadmap prioritization ask, not a design gap on our
+side.</p>
+<hr />
+<h2 id="the-ask">The Ask</h2>
+<h3 id="what-we-need-from-this-room">What we need from this room</h3>
+<p><strong>From Product:</strong> confirm the Phase 1 trade-off is
+acceptable — admins must finish setup in AM <strong>before</strong>
+linking in Rewards, rather than “link now, goes live automatically.”</p>
+<p><strong>From AM / Team Lead:</strong> prioritize AudienceGroupSet
+(entity + UI + APIs) as a roadmap item for Phase 2.</p>
+<p><strong>Open question:</strong> should brand admins see
+audience-health status directly inside the Rewards UI (not just at link
+time), so a post-link issue is visible before a customer notices?</p>
+<p>The goal in one line: <strong>let brands target rewards by audience,
+without ever risking a half-configured launch or a mixed-state
+edit.</strong></p>
+</body>
+</html>
