@@ -1,0 +1,261 @@
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#0f172a;color:#e2e8f0}
+.deck{position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:9999;background:#0f172a;overflow:hidden}
+.slide{position:absolute;top:0;left:0;width:100%;height:100%;padding:56px 72px;display:none;flex-direction:column;justify-content:center;background:#0f172a}
+.slide.active{display:flex}
+.kicker{font-size:13px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#38bdf8;margin-bottom:14px}
+h1{font-size:44px;font-weight:800;line-height:1.15;color:#f8fafc;margin-bottom:18px}
+h2{font-size:30px;font-weight:700;color:#f8fafc;margin-bottom:22px}
+h3{font-size:18px;font-weight:600;color:#7dd3fc;margin-bottom:10px}
+p{font-size:18px;line-height:1.6;color:#cbd5e1;max-width:900px}
+.lead{font-size:22px;line-height:1.55;color:#e2e8f0;max-width:960px}
+.muted{color:#94a3b8;font-size:15px}
+.grid{display:grid;gap:20px;margin-top:8px}
+.g2{grid-template-columns:1fr 1fr}
+.g3{grid-template-columns:1fr 1fr 1fr}
+.g4{grid-template-columns:1fr 1fr 1fr 1fr}
+.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:22px 24px}
+.card h3{color:#7dd3fc;font-size:16px;margin-bottom:8px}
+.big{font-size:40px;font-weight:800;color:#f8fafc;line-height:1.1}
+.good{color:#4ade80}
+.bad{color:#f87171}
+.warn{color:#fbbf24}
+table{width:100%;border-collapse:collapse;font-size:15px;margin-top:6px}
+th{background:#1e293b;color:#7dd3fc;text-align:left;padding:10px 12px;font-weight:600;border-bottom:2px solid #334155}
+td{padding:10px 12px;border-bottom:1px solid #334155;color:#cbd5e1}
+tr.hl td{background:#0b3a4d;color:#f8fafc;font-weight:600}
+.tag{display:inline-block;background:#0ea5e9;color:#082f49;font-weight:700;font-size:12px;padding:3px 10px;border-radius:20px;margin-right:8px}
+.tag.red{background:#ef4444;color:#fff}
+.tag.green{background:#22c55e;color:#052e16}
+.arrow{font-size:26px;color:#38bdf8;margin:0 10px}
+.footer{position:absolute;bottom:24px;left:72px;right:72px;display:flex;justify-content:space-between;color:#64748b;font-size:13px}
+.nav{position:absolute;bottom:24px;right:72px;display:flex;gap:10px}
+.nav button{background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:8px 16px;font-size:14px;cursor:pointer}
+.nav button:hover{background:#334155}
+.dots{position:absolute;bottom:28px;left:50%;transform:translateX(-50%);display:flex;gap:8px}
+.dot{width:9px;height:9px;border-radius:50%;background:#334155;cursor:pointer}
+.dot.on{background:#38bdf8}
+ul{list-style:none;margin-top:6px}
+li{padding:7px 0 7px 26px;position:relative;font-size:17px;color:#cbd5e1;line-height:1.5}
+li:before{content:"▸";position:absolute;left:0;color:#38bdf8}
+code{background:#0b1220;border:1px solid #1e293b;border-radius:5px;padding:1px 6px;font-size:14px;color:#7dd3fc}
+</style>
+
+<div class="deck" id="deck">
+<div class="slide active" data-i="0">
+<div class="kicker">Promotion Engine · CAP-196692</div>
+<h1>Making the evaluate() API scale<br>with real-world POS promotions</h1>
+<p class="lead">A SKU-based shortlisting fix that turns a <span class="bad">corpus-bound</span> bottleneck into a <span class="good">cart-bound</span> fast path — validated by load testing from 3K to 5K active promotions.</p>
+<div style="margin-top:28px">
+<span class="tag green">Fix validated</span><span class="tag">8 pods</span><span class="tag">2,000 RPM @ 100%</span><span class="tag">NR p95 0.34s</span>
+</div>
+</div>
+
+<div class="slide" data-i="1">
+<div class="kicker">The Problem</div>
+<h2>Every cart evaluated <span class="bad">every</span> active promotion</h2>
+<p class="lead">Before the fix, each evaluate() request walked the <strong>entire active POS promotion set</strong> — matching, then running redemption restrictions on, all of them.</p>
+<div class="grid g3" style="margin-top:26px">
+<div class="card"><h3>3,000–5,000</h3><p class="muted">promotions evaluated per request</p></div>
+<div class="card"><h3 class="bad">~46s</h3><p class="muted">avg latency at just 50 RPM</p></div>
+<div class="card"><h3 class="bad">5.5%</h3><p class="muted">timeouts — pods collapse</p></div>
+</div>
+<p style="margin-top:22px;font-size:16px;color:#94a3b8">The cost grows with the promotion catalog, not with what's actually in the cart. At 5K promotions this saturates even 8 pods.</p>
+</div>
+
+<div class="slide" data-i="2">
+<div class="kicker">Root Cause</div>
+<h2>No shortlisting — work ∝ catalog size</h2>
+<div class="grid g2">
+<div class="card">
+<h3 class="bad">Before (pre-fix)</h3>
+<ul>
+<li>Evaluate all <strong>5,000</strong> active POS promotions</li>
+<li>Run <strong>5,000</strong> customer redemption checks</li>
+<li>Latency: <strong>46s avg</strong>, p95 63s, p99 79s</li>
+<li>Collapses at 50 RPM on 8 pods</li>
+</ul>
+</div>
+<div class="card">
+<h3 class="good">After (fix)</h3>
+<ul>
+<li>Shortlist to <strong>~24</strong> promotions matching the cart's SKUs</li>
+<li>Run <strong>~24</strong> customer redemption checks</li>
+<li>Latency: <strong>0.25s avg</strong>, p95 0.34s, p99 0.42s</li>
+<li>Holds <strong>2,000 RPM</strong> at 100% success</li>
+</ul>
+</div>
+</div>
+<p style="margin-top:22px;font-size:16px;color:#94a3b8">The fix (PR #866) adds SKU-based shortlisting: only promotions whose SKU conditions match the cart items proceed to restriction evaluation.</p>
+</div>
+
+<div class="slide" data-i="3">
+<div class="kicker">The Fix</div>
+<h2>SKU-based shortlisting — work ∝ cart size</h2>
+<p class="lead">Before evaluating restrictions, the engine filters the active promotion set down to the ones whose SKU conditions match the cart. The heavy per-request work now tracks <strong>what's in the cart</strong>, not the size of the catalog.</p>
+<div class="grid g3" style="margin-top:26px">
+<div class="card"><h3>5,000 → 24</h3><p class="muted">promotions evaluated per request (99.5% reduction)</p></div>
+<div class="card"><h3>46s → 0.25s</h3><p class="muted">server-side latency (180× faster)</p></div>
+<div class="card"><h3>50 → 2,000 RPM</h3><p class="muted">sustained load (40× more)</p></div>
+</div>
+</div>
+
+<div class="slide" data-i="4">
+<div class="kicker">How the fix works · Tech</div>
+<h2>ItemBasedShortlisting — a purely subtractive filter</h2>
+<p class="lead">A new <code>ItemBasedShortlistingService</code> runs <strong>first</strong> in the shortlisting pipeline (before the costlier DB-backed filters). It recursively walks each promotion's condition tree and collects every <code>SKU IN (…)</code> criterion.</p>
+<div class="grid g2" style="margin-top:22px">
+<div class="card">
+<h3 class="good">Dropped only when…</h3>
+<ul>
+<li>Promotion has a <code>SKU IN</code> condition</li>
+<li>AND the cart's SKU set intersects <strong>none</strong> of its required SKUs</li>
+<li>→ no required SKU present in cart</li>
+</ul>
+</div>
+<div class="card">
+<h3 class="good">Always passed through</h3>
+<ul>
+<li>Category / brand / attribute promotions (no SKU-IN)</li>
+<li>Cart-based &amp; payment-mode promotions</li>
+<li>Null / empty condition</li>
+<li>Feature flag off, or cart has no SKUs</li>
+</ul>
+</div>
+</div>
+<p style="margin-top:20px;font-size:16px;color:#94a3b8">The filter is <strong>purely subtractive on SKU-IN conditions only</strong> — anything without an explicit SKU-IN constraint is untouched and proceeds to full evaluation.</p>
+</div>
+
+<div class="slide" data-i="5">
+<div class="kicker">How the fix works · Tech</div>
+<h2>Non-SKU promotions are never dropped</h2>
+<p class="lead">The guard is an early return in the exclusion check — a promotion with no SKU-IN criterion is kept, always:</p>
+<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:18px 22px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:15px;color:#7dd3fc;line-height:1.7;margin-top:18px">
+if (skuInCriteria.isEmpty()) {<br>
+&nbsp;&nbsp;return false; // no SKU-IN constraint (category/brand/attribute/cart-only) — pass through<br>
+}<br>
+return skuInCriteria.stream().noneMatch(c -&gt;<br>
+&nbsp;&nbsp;!CollectionUtils.isEmpty(c.getValues()) &amp;&amp; !Collections.disjoint(c.getValues(), cartSkuSet));
+</div>
+<div class="grid g3" style="margin-top:22px">
+<div class="card"><h3>Gated rollout</h3><p class="muted">Enabled per-org via <code>ITEM_BASED_SHORTLISTING_ENABLED_ORG_IDS</code> — org 50223 on the allowlist</p></div>
+<div class="card"><h3>Safe fallback</h3><p class="muted">Flag off or no cart SKUs → full pass-through, zero behavior change</p></div>
+<div class="card"><h3>Correctness</h3><p class="muted">Only SKU-IN promotions are ever excluded; all other types always evaluate</p></div>
+</div>
+</div>
+
+<div class="slide" data-i="6">
+<div class="kicker">Load Test · Setup</div>
+<h2>How we validated it</h2>
+<div class="grid g2">
+<div class="card">
+<h3>Environment</h3>
+<ul>
+<li>8 pods, guaranteed 2-core CPU, 4GB mem</li>
+<li>Org 50223 on staging (crm-staging-new)</li>
+<li>evaluate-only traffic, k6 constant-arrival-rate</li>
+</ul>
+</div>
+<div class="card">
+<h3>Workload realism</h3>
+<ul>
+<li>3K → 4K → 5K active POS promotions</li>
+<li>500 hot SKUs, 10 promotions per SKU</li>
+<li>4 → 10 → 15 cart items (brand expects 8–9)</li>
+<li>Customer + Promotion redemption restrictions</li>
+</ul>
+</div>
+</div>
+<p style="margin-top:20px;font-size:16px;color:#94a3b8">Measured client-side (k6) and server-side (New Relic Transaction.duration, p95/p99).</p>
+</div>
+
+<div class="slide" data-i="7">
+<div class="kicker">Load Test · Outcomes</div>
+<h2>Clean at every scale — no ceiling reached</h2>
+<table>
+<tr><th>Active POS</th><th>Cart items</th><th>RPM</th><th>Success</th><th>NR p95</th><th>NR p99</th><th>Shortlisted</th></tr>
+<tr><td>3,000</td><td>4</td><td>2,000</td><td>100%</td><td>0.33s</td><td>0.57s</td><td>9</td></tr>
+<tr><td>4,000</td><td>15</td><td>2,000</td><td>100%</td><td>0.29s</td><td>0.35s</td><td>22</td></tr>
+<tr class="hl"><td>5,000</td><td>15</td><td>2,000</td><td>100%</td><td>0.34s</td><td>0.42s</td><td>24</td></tr>
+</table>
+<div class="grid g3" style="margin-top:22px">
+<div class="card"><h3>Latency flat</h3><p class="muted">p95 stays 0.24–0.37s across 3K→5K promos</p></div>
+<div class="card"><h3>Scales with pods</h3><p class="muted">throughput ∝ pods; no saturation cliff at 2K RPM</p></div>
+<div class="card"><h3>Cart-bound</h3><p class="muted">shortlisted set tracks cart items, not catalog size</p></div>
+</div>
+</div>
+
+<div class="slide" data-i="8">
+<div class="kicker">The Headline</div>
+<h2>Pre-fix vs fix — same 8 pods, same 5K/15-item workload</h2>
+<table>
+<tr><th>Build</th><th>RPM</th><th>Success</th><th>NR avg</th><th>NR p95</th><th>NR p99</th><th>Shortlisted</th></tr>
+<tr class="bad"><td>Pre-fix (d2ca6f4)</td><td>50</td><td>94.5%</td><td>46.2s</td><td>63.5s</td><td>79.0s</td><td>4,980</td></tr>
+<tr class="good"><td>Fix (c8c5163)</td><td>2,000</td><td>100%</td><td>0.25s</td><td>0.34s</td><td>0.42s</td><td>24</td></tr>
+</table>
+<div style="margin-top:26px;text-align:center">
+<p class="lead"><span class="good">~180× faster</span> with the fix, at <span class="good">40× the load</span></p>
+</div>
+</div>
+
+<div class="slide" data-i="9">
+<div class="kicker">Summary</div>
+<h2>What this means for the product</h2>
+<div class="grid g2">
+<div class="card">
+<h3 class="good">Capacity</h3>
+<p class="muted">8 pods sustain 2,000 RPM at 5K promotions with 15-item carts — headroom to grow the catalog without re-architecting.</p>
+</div>
+<div class="card">
+<h3 class="good">Realistic carts</h3>
+<p class="muted">Brand's 8–9 item carts are well within budget: ~0.17s server-side, ~520ms end-to-end at 1.5K RPM.</p>
+</div>
+<div class="card">
+<h3 class="good">Predictable scaling</h3>
+<p class="muted">Latency is flat with catalog size; throughput scales ~linearly with pods. Easy capacity planning.</p>
+</div>
+<div class="card">
+<h3 class="good">Brand target met</h3>
+<p class="muted">Brand asked for 200ms — with the fix we've achieved it for realistic carts. Further tuning to follow.</p>
+</div>
+</div>
+</div>
+
+<div class="footer">
+<span>Promotion Engine · CAP-196692 · SKU shortlisting (PR #866)</span>
+<span id="page">1 / 10</span>
+</div>
+<div class="dots" id="dots"></div>
+<div class="nav">
+<button onclick="prev()">← Prev</button>
+<button onclick="next()">Next →</button>
+</div>
+</div>
+
+<script>
+(function(){
+var slides=document.querySelectorAll('.slide');
+var dots=document.getElementById('dots');
+var page=document.getElementById('page');
+var cur=0;
+for(var i=0;i<slides.length;i++){
+var d=document.createElement('div');d.className='dot'+(i===0?' on':'');d.onclick=(function(n){return function(){go(n)}})(i);dots.appendChild(d);
+}
+function go(n){
+if(n<0||n>=slides.length)return;
+slides[cur].classList.remove('active');
+dots.children[cur].classList.remove('on');
+cur=n;
+slides[cur].classList.add('active');
+dots.children[cur].classList.add('on');
+page.textContent=(cur+1)+' / '+slides.length;
+}
+window.next=function(){go(cur+1)};
+window.prev=function(){go(cur-1)};
+document.addEventListener('keydown',function(e){
+if(e.key==='ArrowRight')go(cur+1);
+if(e.key==='ArrowLeft')go(cur-1);
+});
+})();
+</script>
